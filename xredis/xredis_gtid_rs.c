@@ -28,6 +28,7 @@
 
 #include "server.h"
 #include <gtid.h>
+#include "./xredis_gtid_gaplog.h"
 #include <ctype.h>
 
 void propagateArgsInit(propagateArgs *pargs, struct redisCommand *cmd,
@@ -68,11 +69,8 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs) {
         offset = server.master_repl_offset+1;
     }
 
-    if (server.masterhost == NULL &&
-#ifdef ENABLE_SWAP
-            server.swap_draining_master == NULL &&
-#endif
-            pargs->orig_cmd->proc == gtidCommand) {
+    /* 解析GTID：Master从收到的GTID命令解析，Slave从GTID命令解析 */
+    if (pargs->orig_cmd->proc == gtidCommand) {
         gtid_repr = pargs->orig_argv[1]->ptr;
         uuid = uuidGnoDecode(gtid_repr,sdslen(gtid_repr),&gno,&uuid_len);
     }
@@ -117,6 +115,235 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs) {
     pargs->uuid_len = uuid_len;
     pargs->gno = gno;
     pargs->offset = offset;
+
+    /* 记录gtid到key的映射到gaplog（优化版：使用robj引用计数，避免深拷贝） */
+    if (server.gtid_gaplog && server.gtid_gaplog_enabled && gno > 0) {
+        /* 从命令参数中提取keys和subkeys数组（使用robj指针，增加引用计数） */
+        robj **keys = NULL;
+        robj **subkeys = NULL;
+        size_t key_count = 0;
+
+        /* 确定原始命令参数的位置
+         * 如果命令被重写为gtid格式，原始参数从argv[3]开始
+         * 如果命令没有被重写，原始参数从argv[0]开始
+         */
+        int is_gtid_command = (argv[0] && argv[0]->ptr &&
+                               strcasecmp((char*)argv[0]->ptr, "gtid") == 0);
+        int cmd_offset = is_gtid_command ? 3 : 0;
+        int orig_argc = argc - cmd_offset;
+
+        /* 使用命令指针判断，比字符串比较更高效 */
+        redisCommandProc *cmd_proc = pargs->orig_cmd->proc;
+
+        if (orig_argc >= 2 && argv[cmd_offset] && argv[cmd_offset + 1]) {
+            /* MSET/MSETNX命令：MSET key1 value1 key2 value2 ... */
+            if ((cmd_proc == msetCommand || cmd_proc == msetnxCommand) && orig_argc >= 3) {
+                key_count = (orig_argc - 1) / 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1 + i*2];
+                    subkeys[i] = NULL;
+                }
+            }
+            /* MGET命令：MGET key1 key2 key3 ... */
+            else if (cmd_proc == mgetCommand && orig_argc >= 2) {
+                key_count = orig_argc - 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1 + i];
+                    subkeys[i] = NULL;
+                }
+            }
+            /* DEL/UNLINK命令：DEL key1 key2 key3 ... */
+            else if ((cmd_proc == delCommand || cmd_proc == unlinkCommand) && orig_argc >= 2) {
+                key_count = orig_argc - 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1 + i];
+                    subkeys[i] = NULL;
+                }
+            }
+            /* RENAME/RENAMENX命令：RENAME oldkey newkey */
+            else if ((cmd_proc == renameCommand || cmd_proc == renamenxCommand) && orig_argc >= 3) {
+                key_count = 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+                keys[1] = argv[cmd_offset + 2];
+                subkeys[1] = NULL;
+            }
+            /* SMOVE命令：SMOVE source destination member */
+            else if (cmd_proc == smoveCommand && orig_argc >= 3) {
+                key_count = 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+                keys[1] = argv[cmd_offset + 2];
+                subkeys[1] = NULL;
+            }
+            /* RPOPLPUSH命令：RPOPLPUSH source destination */
+            else if (cmd_proc == rpoplpushCommand && orig_argc >= 3) {
+                key_count = 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+                keys[1] = argv[cmd_offset + 2];
+                subkeys[1] = NULL;
+            }
+            /* BRPOPLPUSH命令 */
+            else if (cmd_proc == brpoplpushCommand && orig_argc >= 4) {
+                key_count = 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+                keys[1] = argv[cmd_offset + 2];
+                subkeys[1] = NULL;
+            }
+            /* BLPOP/BRPOP命令：BLPOP key1 key2 ... timeout */
+            else if ((cmd_proc == blpopCommand || cmd_proc == brpopCommand) && orig_argc >= 3) {
+                key_count = orig_argc - 2;  /* 最后一个参数是timeout */
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1 + i];
+                    subkeys[i] = NULL;
+                }
+            }
+            /* HMSET/HSET命令：HMSET key field1 value1 field2 value2 ... */
+            else if (cmd_proc == hsetCommand && orig_argc >= 4) {
+                key_count = (orig_argc - 2) / 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1];
+                    subkeys[i] = argv[cmd_offset + 2 + i*2];
+                }
+            }
+            /* HMGET命令：HMGET key field1 field2 ... */
+            else if (cmd_proc == hmgetCommand && orig_argc >= 3) {
+                key_count = orig_argc - 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1];
+                    subkeys[i] = argv[cmd_offset + 2 + i];
+                }
+            }
+            /* HDEL命令：HDEL key field1 field2 ... */
+            else if (cmd_proc == hdelCommand && orig_argc >= 3) {
+                key_count = orig_argc - 2;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                for (size_t i = 0; i < key_count; i++) {
+                    keys[i] = argv[cmd_offset + 1];
+                    subkeys[i] = argv[cmd_offset + 2 + i];
+                }
+            }
+            /* 简单单key命令：SET, GET, INCR 等 */
+            else if (cmd_proc == setCommand || cmd_proc == getCommand ||
+                     cmd_proc == appendCommand || cmd_proc == incrCommand ||
+                     cmd_proc == decrCommand || cmd_proc == incrbyCommand ||
+                     cmd_proc == decrbyCommand || cmd_proc == setexCommand ||
+                     cmd_proc == setnxCommand || cmd_proc == psetexCommand ||
+                     cmd_proc == getsetCommand || cmd_proc == getrangeCommand ||
+                     cmd_proc == setrangeCommand || cmd_proc == strlenCommand) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+            }
+            /* Hash单field命令：HSETNX, HGET, HINCRBY, HINCRBYFLOAT */
+            else if ((cmd_proc == hsetnxCommand || cmd_proc == hgetCommand ||
+                      cmd_proc == hincrbyCommand || cmd_proc == hincrbyfloatCommand) && orig_argc >= 3) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = argv[cmd_offset + 2];
+            }
+            /* List命令：LPUSH, RPUSH, LPOP, RPOP 等 */
+            else if (cmd_proc == lpushCommand || cmd_proc == rpushCommand ||
+                     cmd_proc == lpushxCommand || cmd_proc == rpushxCommand ||
+                     cmd_proc == lpopCommand || cmd_proc == rpopCommand ||
+                     cmd_proc == llenCommand || cmd_proc == lindexCommand ||
+                     cmd_proc == lsetCommand || cmd_proc == lremCommand ||
+                     cmd_proc == linsertCommand || cmd_proc == lrangeCommand ||
+                     cmd_proc == ltrimCommand) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+            }
+            /* Set命令：SADD, SREM, SCARD 等 */
+            else if (cmd_proc == saddCommand || cmd_proc == sremCommand ||
+                     cmd_proc == scardCommand || cmd_proc == spopCommand ||
+                     cmd_proc == sismemberCommand || cmd_proc == srandmemberCommand) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+            }
+            /* ZSet命令：ZADD, ZREM, ZCARD 等 */
+            else if (cmd_proc == zaddCommand || cmd_proc == zremCommand ||
+                     cmd_proc == zincrbyCommand || cmd_proc == zcardCommand ||
+                     cmd_proc == zscoreCommand || cmd_proc == zrankCommand ||
+                     cmd_proc == zrevrankCommand || cmd_proc == zcountCommand ||
+                     cmd_proc == zrangeCommand || cmd_proc == zrevrangeCommand ||
+                     cmd_proc == zrangebyscoreCommand || cmd_proc == zrevrangebyscoreCommand ||
+                     cmd_proc == zremrangebyrankCommand || cmd_proc == zremrangebyscoreCommand ||
+                     cmd_proc == zremrangebylexCommand) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+            }
+            /* Stream命令：XADD, XDEL, XTRIM 等 */
+            else if (cmd_proc == xaddCommand || cmd_proc == xdelCommand ||
+                     cmd_proc == xtrimCommand || cmd_proc == xlenCommand ||
+                     cmd_proc == xrangeCommand || cmd_proc == xrevrangeCommand ||
+                     cmd_proc == xreadCommand) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+            }
+            /* 其他写命令：默认使用第一个参数作为key */
+            else if (orig_argc >= 2) {
+                key_count = 1;
+                keys = zmalloc(sizeof(robj*) * key_count);
+                subkeys = zmalloc(sizeof(robj*) * key_count);
+                keys[0] = argv[cmd_offset + 1];
+                subkeys[0] = NULL;
+            }
+        }
+
+        if (keys && key_count > 0) {
+            /* 创建sds格式的uuid用于gaplog */
+            sds uuid_sds = sdsnewlen(uuid, uuid_len);
+            gtidGaplogAppend(server.gtid_gaplog, uuid_sds, gno, keys, subkeys, key_count);
+            sdsfree(uuid_sds);
+            /* 注意：keys和subkeys数组会被gtidGaplogAppend接管，内部会增加robj引用计数 */
+            /* 释放数组本身，但robj对象已被gaplog引用计数保护 */
+            zfree(keys);
+            if (subkeys) zfree(subkeys);
+        } else if (keys) {
+            /* 如果没有成功添加，释放分配的数组 */
+            zfree(keys);
+            if (subkeys) zfree(subkeys);
+        }
+    }
 }
 
 void propagateArgsDeinit(propagateArgs *pargs) {

@@ -13,7 +13,7 @@ endif
 endif
 endif
 
-FINAL_CFLAGS=$(STD) $(OPTIMIZATION) $(CFLAGS) -I./include -I./
+FINAL_CFLAGS=$(STD) $(OPTIMIZATION) $(CFLAGS) -I./include -I./ -I../../src
 
 CTRIP_CC=$(CC) $(FINAL_CFLAGS)
 GTID_LIB=lib/libgtid.a

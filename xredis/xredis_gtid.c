@@ -28,6 +28,7 @@
 
 #include "server.h"
 #include <gtid.h>
+#include "./xredis_gtid_gaplog.h"
 #include <ctype.h>
 
 
@@ -425,6 +426,18 @@ void gtidxCommand(client *c) {
             "    Locate xsync continue position",
             "UUID-INTRESTED SET <*|?>",
             "    SET uuid.interested to * or ?",
+            "GAPLOG LEN",
+            "    Get gaplog entries count.",
+            "GAPLOG LIST [COUNT count] [UUID uuid]",
+            "    List gaplog entries.",
+            "GAPLOG GET <gtid>",
+            "    Get key mapping by gtid.",
+            "GAPLOG CLEAR",
+            "    Clear all gaplog entries.",
+            "GAPLOG STAT",
+            "    Show gaplog statistics.",
+            "GAPLOG TRIM [MAXENTRIES count]",
+            "    Trim gaplog to specified size.",
             NULL
         };
         addReplyHelp(c, help);
@@ -593,6 +606,221 @@ void gtidxCommand(client *c) {
             }
         } else {
             addReplyError(c,"Syntax error");
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"gaplog") && c->argc >= 3) {
+        /* GTIDX GAPLOG 子命令处理 */
+        if (!server.gtid_gaplog_enabled) {
+            addReplyError(c, "gaplog is disabled");
+            return;
+        }
+
+        /* GTIDX GAPLOG LEN - 获取gaplog条目数 */
+        if (!strcasecmp(c->argv[2]->ptr,"len") && c->argc == 3) {
+            if (server.gtid_gaplog) {
+                addReplyLongLong(c, gtidGaplogGetCount(server.gtid_gaplog));
+            } else {
+                addReplyLongLong(c, 0);
+            }
+        }
+        /* GTIDX GAPLOG LIST - 列出gaplog条目 */
+        else if (!strcasecmp(c->argv[2]->ptr,"list") && c->argc >= 3) {
+            if (server.gtid_gaplog == NULL || gtidGaplogGetCount(server.gtid_gaplog) == 0) {
+                addReplyArrayLen(c, 0);
+                return;
+            }
+
+            /* 解析参数 */
+            size_t count = 10;  /* 默认返回10条 */
+            sds uuid_filter = NULL;
+
+            for (int i = 3; i < c->argc; i++) {
+                if (!strcasecmp(c->argv[i]->ptr,"count") && i + 1 < c->argc) {
+                    count = atoi(c->argv[i+1]->ptr);
+                    i++;
+                } else if (!strcasecmp(c->argv[i]->ptr,"uuid") && i + 1 < c->argc) {
+                    uuid_filter = c->argv[i+1]->ptr;
+                    i++;
+                }
+            }
+
+            /* 收集符合条件的条目 */
+            size_t actual_count = 0;
+            gtidKeyMapping **result = gtidGaplogList(server.gtid_gaplog,
+                                                     uuid_filter, count, &actual_count);
+
+            if (result == NULL) {
+                addReplyArrayLen(c, 0);
+                return;
+            }
+
+            /* 构建返回结果 */
+            addReplyArrayLen(c, actual_count);
+            for (size_t i = 0; i < actual_count; i++) {
+                gtidKeyMapping *mapping = result[i];
+
+                /* 每个条目返回4个字段：gtid, keys数组, key_count, timestamp */
+                addReplyArrayLen(c, 4);
+
+                /* gtid: uuid:gno */
+                sds gtid = sdscatprintf(sdsempty(), "%s:%lld",
+                                        mapping->uuid, mapping->gno);
+                addReplyBulkSds(c, gtid);
+
+                /* keys数组 - 返回所有key及其subkey */
+                addReplyArrayLen(c, mapping->key_count);
+                for (size_t j = 0; j < mapping->key_count; j++) {
+                    sds key = mapping->keys[j];
+                    sds subkey = mapping->subkeys ? mapping->subkeys[j] : NULL;
+                    if (key && sdslen(key) > 0) {
+                        if (subkey && sdslen(subkey) > 0) {
+                            /* 有subkey: 返回 [key, subkey] */
+                            addReplyArrayLen(c, 2);
+                            addReplyBulkCBuffer(c, key, sdslen(key));
+                            addReplyBulkCBuffer(c, subkey, sdslen(subkey));
+                        } else {
+                            /* 无subkey: 返回 key */
+                            addReplyBulkCBuffer(c, key, sdslen(key));
+                        }
+                    } else {
+                        /* key为空，返回空字符串 */
+                        addReplyBulkCBuffer(c, "", 0);
+                    }
+                }
+
+                /* key_count */
+                addReplyLongLong(c, mapping->key_count);
+
+                /* timestamp */
+                addReplyBulkLongLong(c, mapping->timestamp);
+            }
+
+            zfree(result);
+        }
+        /* GTIDX GAPLOG GET - 根据gtid查询key */
+        else if (!strcasecmp(c->argv[2]->ptr,"get") && c->argc == 4) {
+            if (server.gtid_gaplog == NULL) {
+                addReplyNull(c);
+                return;
+            }
+
+            /* 解析gtid: uuid:gno */
+            sds gtid_str = c->argv[3]->ptr;
+            char *colon = strchr(gtid_str, ':');
+            if (colon == NULL) {
+                addReplyError(c, "Invalid gtid format, expected uuid:gno");
+                return;
+            }
+
+            size_t uuid_len = colon - gtid_str;
+            gno_t gno = atoll(colon + 1);
+
+            /* 创建临时sds格式的uuid用于查找 */
+            sds uuid_sds = sdsnewlen(gtid_str, uuid_len);
+
+            /* 查询映射 - 使用gtidGaplogGet获取gtidGnoEntry */
+            gtidGnoEntry *entry = gtidGaplogGet(server.gtid_gaplog, uuid_sds, gno);
+            sdsfree(uuid_sds);
+
+            if (entry == NULL) {
+                addReplyNull(c);
+                return;
+            }
+
+            /* 返回keys数组（entry->keys现在是robj指针数组，需要通过->ptr获取sds） */
+            addReplyArrayLen(c, entry->key_count);
+            for (size_t i = 0; i < entry->key_count; i++) {
+                sds key = entry->keys[i] ? entry->keys[i]->ptr : NULL;
+                sds subkey = entry->subkeys && entry->subkeys[i] ? entry->subkeys[i]->ptr : NULL;
+                if (key && sdslen(key) > 0) {
+                    if (subkey && sdslen(subkey) > 0) {
+                        /* 有subkey: 返回 [key, subkey] */
+                        addReplyArrayLen(c, 2);
+                        addReplyBulkCBuffer(c, key, sdslen(key));
+                        addReplyBulkCBuffer(c, subkey, sdslen(subkey));
+                    } else {
+                        /* 无subkey: 返回 key */
+                        addReplyBulkCBuffer(c, key, sdslen(key));
+                    }
+                } else {
+                    /* key为空，返回空字符串 */
+                    addReplyBulkCBuffer(c, "", 0);
+                }
+            }
+            /* 注意：entry是gaplog内部的引用，不需要释放 */
+        }
+        /* GTIDX GAPLOG CLEAR - 清空gaplog */
+        else if (!strcasecmp(c->argv[2]->ptr,"clear") && c->argc == 3) {
+            if (server.gtid_gaplog) {
+                gtidGaplogClear(server.gtid_gaplog);
+            }
+            addReply(c, shared.ok);
+        }
+        /* GTIDX GAPLOG STAT - 获取统计信息 */
+        else if (!strcasecmp(c->argv[2]->ptr,"stat") && c->argc == 3) {
+            if (server.gtid_gaplog == NULL) {
+                addReplyBulkSds(c, sdsempty());
+                return;
+            }
+
+            gtidGaplogStat stat;
+            gtidGaplogGetStat(server.gtid_gaplog, &stat);
+
+            sds stat_str = sdscatprintf(sdsempty(),
+                "total_entries:%zu\r\n"
+                "total_memory:%zu\r\n"
+                "uuid_count:%zu\r\n"
+                "hit_count:%zu\r\n"
+                "miss_count:%zu",
+                stat.total_entries,
+                stat.total_memory,
+                stat.uuid_count,
+                stat.hit_count,
+                stat.miss_count);
+
+            addReplyBulkSds(c, stat_str);
+        }
+        /* GTIDX GAPLOG TRIM - 手动清理 */
+        else if (!strcasecmp(c->argv[2]->ptr,"trim") && c->argc >= 3) {
+            if (server.gtid_gaplog == NULL) {
+                addReplyLongLong(c, 0);
+                return;
+            }
+
+            /* 默认清理到总条目数的80% */
+            size_t max_entries = gtidGaplogGetCount(server.gtid_gaplog) * 80 / 100;
+            if (max_entries == 0) max_entries = 1;  /* 至少保留1个 */
+
+            /* 解析MAXENTRIES参数 */
+            for (int i = 3; i < c->argc; i++) {
+                if (!strcasecmp(c->argv[i]->ptr,"maxentries") && i + 1 < c->argc) {
+                    max_entries = atoll(c->argv[i+1]->ptr);
+                    i++;
+                }
+            }
+
+            /* 使用gtidGaplogSetMaxGap设置新的最大条目数，然后自动清理 */
+            size_t old_max = server.gtid_gaplog->max_gap;
+            gtidGaplogSetMaxGap(server.gtid_gaplog, max_entries);
+            size_t trimmed = 0;
+
+            /* 遍历所有uuid entry进行清理 */
+            dictIterator *di = dictGetIterator(server.gtid_gaplog->uuid_index);
+            dictEntry *de;
+            while ((de = dictNext(di)) != NULL) {
+                gtidUuidEntry *uuid_entry = dictGetVal(de);
+                if (uuid_entry->count > max_entries) {
+                    trimmed += uuid_entry->count - max_entries;
+                }
+            }
+            dictReleaseIterator(di);
+
+            /* 恢复原来的max_gap设置（TRIM命令只是临时清理） */
+            gtidGaplogSetMaxGap(server.gtid_gaplog, old_max);
+
+            addReplyLongLong(c, trimmed);
+        }
+        else {
+            addReplySubcommandSyntaxError(c);
         }
     } else {
         addReplySubcommandSyntaxError(c);
