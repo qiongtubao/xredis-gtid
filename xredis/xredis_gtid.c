@@ -277,6 +277,110 @@ void xsyncUuidInterestedInit() {
     xsyncUuidInterestedSet(GTID_XSYNC_UUID_INTERESTED_DEFAULT);
 }
 
+/* ========== gtidGapLogKeyInfo/KeysInfos 创建/释放函数 ========== */
+
+gtidGapLogKeyInfo *gtidGapLogKeyInfoCreate(int dbid, robj *key, robj **subkeys, int subkeys_count) {
+    gtidGapLogKeyInfo *ki = zmalloc(sizeof(gtidGapLogKeyInfo));
+    ki->dbid = dbid;
+    ki->key = key;
+    incrRefCount(key);
+    ki->subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+    ki->subkeys_count = subkeys_count;
+    for (int i = 0; i < subkeys_count; i++) {
+        ki->subkeys[i] = subkeys[i];
+        incrRefCount(subkeys[i]);
+    }
+    return ki;
+}
+
+void gtidGapLogKeyInfoFree(gtidGapLogKeyInfo *ki) {
+    if (ki == NULL) return;
+    decrRefCount(ki->key);
+    for (int i = 0; i < ki->subkeys_count; i++) {
+        decrRefCount(ki->subkeys[i]);
+    }
+    zfree(ki->subkeys);
+    zfree(ki);
+}
+
+gtidGapLogKeysInfos *gtidGapLogKeysInfosCreate() {
+    gtidGapLogKeysInfos *kis = zmalloc(sizeof(gtidGapLogKeysInfos));
+    kis->keys = NULL;
+    kis->size = 0;
+    return kis;
+}
+
+void gtidGapLogKeysInfosFree(gtidGapLogKeysInfos *kis) {
+    if (kis == NULL) return;
+    for (int i = 0; i < kis->size; i++) {
+        gtidGapLogKeyInfoFree(kis->keys[i]);
+    }
+    zfree(kis->keys);
+    zfree(kis);
+}
+
+/* ========== gtidGapLogGnoEntry 内部结构体（不在头文件中） ========== */
+
+typedef struct gtidGapLogGnoEntry {
+    long long gno;                      /* GTID序号 */
+    gtidGapLogKeysInfos *keys_infos;    /* 指向keys_infos的指针 */
+} gtidGapLogGnoEntry;
+
+gtidGapLogGnoEntry *gtidGapLogGnoEntryCreate(long long gno, gtidGapLogKeysInfos *keys_infos) {
+    gtidGapLogGnoEntry *entry = zmalloc(sizeof(gtidGapLogGnoEntry));
+    entry->gno = gno;
+    entry->keys_infos = keys_infos;
+    return entry;
+}
+
+void gtidGapLogGnoEntryFree(void *ptr) {
+    gtidGapLogGnoEntry *entry = (gtidGapLogGnoEntry*)ptr;
+    if (entry) {
+        if (entry->keys_infos) {
+            gtidGapLogKeysInfosFree(entry->keys_infos);
+        }
+        zfree(entry);
+    }
+}
+
+/* ========== gtid_gap_log 字典的 val 释放函数 ========== */
+
+static void gtidGapLogListDestructor(void *privdata, void *val) {
+    UNUSED(privdata);
+    list *l = (list*)val;
+    if (l) {
+        listRelease(l);
+    }
+}
+
+/* gtid_gap_log 字典类型 */
+static dictType gtid_gap_log_dict_type = {
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .keyDestructor = dictSdsDestructor,
+    .valDestructor = gtidGapLogListDestructor
+};
+
+/* ========== uuidSet 释放函数（用于 gtid_gap_log_list） ========== */
+
+static void uuidSetFreeWrapper(void *ptr) {
+    uuidSet *us = (uuidSet*)ptr;
+    if (us) {
+        uuidSetFree(us);
+    }
+}
+
+/* gaplog 初始化 */
+void gtidGapLogInit() {
+    server.gtid_gap_log = dictCreate(&gtid_gap_log_dict_type, NULL);
+    server.gtid_gap_log_list = listCreate();
+    listSetFreeMethod(server.gtid_gap_log_list, uuidSetFreeWrapper);
+    server.gtid_gaplog_entry_count = 0;
+    server.gap_log_size = 0;
+}
+
+
+
 void forceXsyncFullResync() {
     xsyncUuidInterestedSet(GTID_XSYNC_UUID_INTERESTED_FULLRESYNC);
 }
@@ -343,7 +447,8 @@ sds genGtidInfoString(sds info) {
             "gtid_uuid_interested:%s\r\n"
             "gtid_xsync_fullresync_indicator:%lld\r\n"
             "gtid_executed_cmd_count:%lld\r\n"
-            "gtid_ignored_cmd_count:%lld\r\n",
+            "gtid_ignored_cmd_count:%lld\r\n"
+            "gtid_gaplog_entries:%lld\r\n",
             server.uuid,
             master_uuid,
             gtid_set_repr,
@@ -364,7 +469,8 @@ sds genGtidInfoString(sds info) {
             server.gtid_uuid_interested,
             server.gtid_xsync_fullresync_indicator,
             server.gtid_executed_cmd_count,
-            server.gtid_ignored_cmd_count);
+            server.gtid_ignored_cmd_count,
+            server.gtid_gaplog_entry_count);
 
     sdsfree(gtid_set_repr);
     sdsfree(gtid_executed_repr);
@@ -425,6 +531,12 @@ void gtidxCommand(client *c) {
             "    Locate xsync continue position",
             "UUID-INTRESTED SET <*|?>",
             "    SET uuid.interested to * or ?",
+            "GAPLOG LEN",
+            "    Get gaplog entries count.",
+            "GAPLOG RANGE <uuid> <start> <end>",
+            "    Query gaplog entries by uuid and gno range.",
+            "GAPLOG CLEAR",
+            "    Clear all gaplog entries.",
             NULL
         };
         addReplyHelp(c, help);
@@ -593,6 +705,79 @@ void gtidxCommand(client *c) {
             }
         } else {
             addReplyError(c,"Syntax error");
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"gaplog") && c->argc >= 3) {
+        /* GAPLOG子命令: LEN / RANGE / CLEAR */
+        if (!strcasecmp(c->argv[2]->ptr,"len") && c->argc == 3) {
+            addReplyLongLong(c, server.gtid_gaplog_entry_count);
+        } else if (!strcasecmp(c->argv[2]->ptr,"range") && c->argc == 6) {
+            /* GTIDX GAPLOG RANGE <uuid> <start_gno> <end_gno>
+             * 从 gtid_gap_log 字典中找到指定 uuid 的 list，
+             * 遍历 list 中 gno 在 [start,end] 范围的条目
+             * 返回数组: [gno, keys_infos_json, gno, keys_infos_json, ...] */
+            sds uuid = c->argv[3]->ptr;
+            long long start_gno, end_gno;
+            if (getLongLongFromObjectOrReply(c, c->argv[4], &start_gno, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[5], &end_gno, NULL) != C_OK) return;
+
+            /* 从字典中查找 uuid 对应的 list */
+            dictEntry *de = dictFind(server.gtid_gap_log, uuid);
+            if (de == NULL) {
+                addReplyArrayLen(c, 0);
+                return;
+            }
+            list *gno_list = dictGetVal(de);
+
+            /* 遍历 list,收集在[start_gno, end_gno]范围的元素 */
+            /* 先统计范围内条目数 */
+            long count = 0;
+            listIter li;
+            listNode *ln;
+            listRewind(gno_list, &li);
+            while ((ln = listNext(&li)) != NULL) {
+                gtidGapLogGnoEntry *entry = (gtidGapLogGnoEntry*)listNodeValue(ln);
+                if (entry->gno > end_gno) break;
+                if (entry->gno >= start_gno) count++;
+            }
+
+            /* 返回格式: 每个条目返回 [gno, keys_infos]
+             * keys_infos 格式: [[dbid, key, [subkeys...]], ...] */
+            addReplyArrayLen(c, count * 2);
+            listRewind(gno_list, &li);
+            while ((ln = listNext(&li)) != NULL) {
+                gtidGapLogGnoEntry *entry = (gtidGapLogGnoEntry*)listNodeValue(ln);
+                if (entry->gno > end_gno) break;
+                if (entry->gno >= start_gno) {
+                    /* 1. gno */
+                    addReplyBulkLongLong(c, entry->gno);
+
+                    /* 2. 获取 gtidGapLogKeysInfos* */
+                    gtidGapLogKeysInfos *kis = entry->keys_infos;
+
+                    /* 返回 keys_infos 数组 */
+                    addReplyArrayLen(c, kis->size);
+                    for (int i = 0; i < kis->size; i++) {
+                        gtidGapLogKeyInfo *ki = kis->keys[i];
+                        /* 每个 keyInfo: [dbid, key, [subkeys...]] */
+                        addReplyArrayLen(c, 3);
+                        addReplyBulkLongLong(c, ki->dbid);
+                        addReplyBulk(c, ki->key);
+                        addReplyArrayLen(c, ki->subkeys_count);
+                        for (int j = 0; j < ki->subkeys_count; j++) {
+                            addReplyBulk(c, ki->subkeys[j]);
+                        }
+                    }
+                }
+            }
+        } else if (!strcasecmp(c->argv[2]->ptr,"clear") && c->argc == 3) {
+            /* 释放所有字典条目和 FIFO list 节点 */
+            dictEmpty(server.gtid_gap_log, NULL);
+            listEmpty(server.gtid_gap_log_list);
+            server.gtid_gaplog_entry_count = 0;
+            server.gap_log_size = 0;
+            addReply(c,shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
         }
     } else {
         addReplySubcommandSyntaxError(c);

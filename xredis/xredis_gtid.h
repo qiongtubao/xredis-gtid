@@ -39,6 +39,8 @@ typedef struct client client;
 typedef struct redisObject robj;
 typedef struct _rio rio;
 
+uint64_t dictStringHash(const void *key); // in latency.c
+
 /* Misc */
 int isGtidExecCommand(client *c);
 sds gtidSetDump(gtidSet *gtid_set);
@@ -254,6 +256,25 @@ sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv);
 long long addReplyReplicationBacklog(client *c, long long offset);
 void afterErrorReply(client *c, const char *s, size_t len);
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
+
+
+typedef struct gtidGapLogKeyInfo {
+    int dbid;
+    struct redisObject* key;
+    struct redisObject** subkeys;
+    int subkeys_count;
+} gtidGapLogKeyInfo;
+
+typedef struct gtidGapLogKeysInfos {
+    gtidGapLogKeyInfo** keys;
+    int size;
+} gtidGapLogKeysInfos;
+
+void gtidGapLogInit();
+gtidGapLogKeysInfos *gtidGapLogKeysInfosCreate();
+void gtidGapLogKeysInfosFree(gtidGapLogKeysInfos *kis);
+gtidGapLogKeyInfo *gtidGapLogKeyInfoCreate(int dbid, robj *key, robj **subkeys, int subkeys_count);
+void gtidGapLogKeyInfoFree(gtidGapLogKeyInfo *ki);
 
 int gtidTest(int argc, char **argv, int accurate);
 
