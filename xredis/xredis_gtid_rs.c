@@ -77,19 +77,30 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs) {
         uuid = uuidGnoDecode(gtid_repr,sdslen(gtid_repr),&gno,&uuid_len);
     }
 
-    /* Rewrite args to gtid... if needed */
-    if (server.masterhost != NULL ||
-#ifdef ENABLE_SWAP
-            server.swap_draining_master != NULL ||
-#endif
-            !server.gtid_enabled ||
+    /* Rewrite args to gtid... if needed
+     * 注意：slave 接收来自 master 的命令时，命令已经是 GTID 格式，不需要再包装
+     * 但 slave 独立写入（来自本地客户端）时，也需要生成 GTID，以便 gaplog 记录
+     *
+     * MULTI/EXEC 事务处理：
+     * - MULTI 命令不生成 GTID（propagate_in_transaction 在 MULTI propagate 之前已设置）
+     * - 事务内部命令不生成 GTID（使用原始格式）
+     * - EXEC 命令生成 GTID（记录整个事务）
+     */
+    int use_orig = !server.gtid_enabled ||
             pargs->orig_cmd->proc == gtidCommand ||
             pargs->orig_cmd->proc == publishCommand ||
             (server.propagate_in_transaction &&
-             pargs->orig_cmd != server.execCommand)) {
+             pargs->orig_cmd != server.execCommand);
+
+    if (use_orig) {
         cmd = pargs->orig_cmd;
         argc = pargs->orig_argc;
         argv = pargs->orig_argv;
+
+        /* 事务内部命令：
+         * - backlog 已经由 MULTI 命令创建
+         * - 不需要记录到 gtid_seq（MULTI 命令已经记录了）
+         * - 保持 gno=0，这样 touch_index=false，不会记录到 gtid_seq */
     } else {
         gno = gtidSetCurrentUuidSetNext(server.gtid_executed,1);
 
@@ -401,7 +412,6 @@ void ctrip_replicationFeedSlaves(list *slaves, int dictid, robj **argv,
     replicationFeedSlaves(slaves,dictid,argv,argc);
     if (touch_index) gtidSeqTrim(server.gtid_seq,server.repl_backlog_off);
 }
-
 void ctrip_replicationFeedSlavesFromMasterStream(list *slaves, char *buf,
         size_t buflen, const char *uuid, size_t uuid_len, gno_t gno, long long offset) {
     int touch_index = uuid != NULL && gno >= GTID_GNO_INITIAL && server.gtid_seq;

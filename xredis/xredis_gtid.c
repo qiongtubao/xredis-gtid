@@ -277,6 +277,214 @@ void xsyncUuidInterestedInit() {
     xsyncUuidInterestedSet(GTID_XSYNC_UUID_INTERESTED_DEFAULT);
 }
 
+/* ========== gtidGapLogKeyInfo/KeysInfos 创建/释放函数 ========== */
+
+gtidGapLogKeyInfo *gtidGapLogKeyInfoCreate(int dbid, robj *key, robj **subkeys, int subkeys_count) {
+    gtidGapLogKeyInfo *ki = zmalloc(sizeof(gtidGapLogKeyInfo));
+    ki->dbid = dbid;
+    ki->key = key;
+    incrRefCount(key);
+    ki->subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+    ki->subkeys_count = subkeys_count;
+    for (int i = 0; i < subkeys_count; i++) {
+        ki->subkeys[i] = subkeys[i];
+        incrRefCount(subkeys[i]);
+    }
+    return ki;
+}
+
+void gtidGapLogKeyInfoFree(gtidGapLogKeyInfo *ki) {
+    if (ki == NULL) return;
+    decrRefCount(ki->key);
+    for (int i = 0; i < ki->subkeys_count; i++) {
+        decrRefCount(ki->subkeys[i]);
+    }
+    zfree(ki->subkeys);
+    zfree(ki);
+}
+
+gtidGapLogKeysInfos *gtidGapLogKeysInfosCreate() {
+    gtidGapLogKeysInfos *kis = zmalloc(sizeof(gtidGapLogKeysInfos));
+    kis->keys = NULL;
+    kis->size = 0;
+    return kis;
+}
+
+void gtidGapLogKeysInfosFree(gtidGapLogKeysInfos *kis) {
+    if (kis == NULL) return;
+    for (int i = 0; i < kis->size; i++) {
+        gtidGapLogKeyInfoFree(kis->keys[i]);
+    }
+    zfree(kis->keys);
+    zfree(kis);
+}
+
+/* ========== gaplogSkiplist 实现 ========== */
+
+/* 随机生成跳表节点层数，每层概率 0.25（比 Redis zskiplist 的 0.5 更节省内存） */
+static int gaplogSkiplistRandomLevel(void) {
+    int level = 1;
+    while (level < GAPLOG_SKIPLIST_MAXLEVEL && (random() & 0x3) == 0)
+        level++;
+    return level;
+}
+
+/* 创建一个跳表节点（含柔性数组 level 层） */
+static gaplogSkiplistNode *gaplogSkiplistNodeCreate(int level, long long gno,
+                                                     gtidGapLogKeysInfos *keys_infos) {
+    gaplogSkiplistNode *node = zmalloc(sizeof(gaplogSkiplistNode) +
+                                       sizeof(node->level[0]) * level);
+    node->gno = gno;
+    node->keys_infos = keys_infos;
+    node->backward = NULL;
+    for (int i = 0; i < level; i++)
+        node->level[i].forward = NULL;
+    return node;
+}
+
+/* 释放节点（含 keys_infos） */
+static void gaplogSkiplistNodeFree(gaplogSkiplistNode *node) {
+    if (node->keys_infos) gtidGapLogKeysInfosFree(node->keys_infos);
+    zfree(node);
+}
+
+/* 创建跳表（含哨兵 header） */
+gaplogSkiplist *gaplogSkiplistCreate(void) {
+    gaplogSkiplist *sl = zmalloc(sizeof(gaplogSkiplist));
+    sl->level = 1;
+    sl->length = 0;
+    sl->tail = NULL;
+    /* header 不存数据，层数为最大层 */
+    sl->header = gaplogSkiplistNodeCreate(GAPLOG_SKIPLIST_MAXLEVEL, 0, NULL);
+    return sl;
+}
+
+/* 释放跳表所有节点及跳表本身 */
+void gaplogSkiplistFree(gaplogSkiplist *sl) {
+    gaplogSkiplistNode *node = sl->header->level[0].forward;
+    zfree(sl->header);
+    while (node) {
+        gaplogSkiplistNode *next = node->level[0].forward;
+        gaplogSkiplistNodeFree(node);
+        node = next;
+    }
+    zfree(sl);
+}
+
+/* 按 gno 升序插入节点 */
+void gaplogSkiplistInsert(gaplogSkiplist *sl, long long gno,
+                           gtidGapLogKeysInfos *keys_infos) {
+    /* update[i]: 第 i 层中，新节点的前驱节点 */
+    gaplogSkiplistNode *update[GAPLOG_SKIPLIST_MAXLEVEL];
+    gaplogSkiplistNode *x = sl->header;
+
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward && x->level[i].forward->gno < gno)
+            x = x->level[i].forward;
+        update[i] = x;
+    }
+
+    int level = gaplogSkiplistRandomLevel();
+    /* 新层初始化：update 指向 header */
+    if (level > sl->level) {
+        for (int i = sl->level; i < level; i++)
+            update[i] = sl->header;
+        sl->level = level;
+    }
+
+    x = gaplogSkiplistNodeCreate(level, gno, keys_infos);
+    for (int i = 0; i < level; i++) {
+        x->level[i].forward = update[i]->level[i].forward;
+        update[i]->level[i].forward = x;
+    }
+
+    /* 维护 backward 指针（第 0 层） */
+    x->backward = (update[0] == sl->header) ? NULL : update[0];
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x;
+    else
+        sl->tail = x;
+
+    sl->length++;
+}
+
+/* 删除指定 gno 的节点，返回 1 表示删除成功，0 表示未找到 */
+int gaplogSkiplistDelete(gaplogSkiplist *sl, long long gno) {
+    gaplogSkiplistNode *update[GAPLOG_SKIPLIST_MAXLEVEL];
+    gaplogSkiplistNode *x = sl->header;
+
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward && x->level[i].forward->gno < gno)
+            x = x->level[i].forward;
+        update[i] = x;
+    }
+
+    x = x->level[0].forward;
+    if (x == NULL || x->gno != gno) return 0;
+
+    for (int i = 0; i < sl->level; i++) {
+        if (update[i]->level[i].forward != x) break;
+        update[i]->level[i].forward = x->level[i].forward;
+    }
+
+    /* 维护 backward 指针 */
+    if (x->level[0].forward)
+        x->level[0].forward->backward = x->backward;
+    else
+        sl->tail = x->backward;
+
+    /* 缩减层数 */
+    while (sl->level > 1 && sl->header->level[sl->level - 1].forward == NULL)
+        sl->level--;
+
+    gaplogSkiplistNodeFree(x);
+    sl->length--;
+    return 1;
+}
+
+/* 返回跳表中 gno 最小的节点（即第 0 层第一个节点），NULL 表示空 */
+gaplogSkiplistNode *gaplogSkiplistFirst(gaplogSkiplist *sl) {
+    return sl->header->level[0].forward;
+}
+
+/* ========== gtid_gap_log 字典的 val 释放函数（释放 gaplogSkiplist） ========== */
+
+static void gtidGapLogSkiplistDestructor(void *privdata, void *val) {
+    UNUSED(privdata);
+    gaplogSkiplist *sl = (gaplogSkiplist*)val;
+    if (sl) {
+        gaplogSkiplistFree(sl);
+    }
+}
+
+/* gtid_gap_log 字典类型 */
+static dictType gtid_gap_log_dict_type = {
+    .hashFunction = dictSdsHash,
+    .keyCompare = dictSdsKeyCompare,
+    .keyDestructor = dictSdsDestructor,
+    .valDestructor = gtidGapLogSkiplistDestructor
+};
+
+/* ========== uuidSet 释放函数（用于 gtid_gap_log_list） ========== */
+
+static void uuidSetFreeWrapper(void *ptr) {
+    uuidSet *us = (uuidSet*)ptr;
+    if (us) {
+        uuidSetFree(us);
+    }
+}
+
+/* gaplog 初始化 */
+void gtidGapLogInit() {
+    server.gtid_gap_log = dictCreate(&gtid_gap_log_dict_type, NULL);
+    server.gtid_gap_log_list = listCreate();
+    listSetFreeMethod(server.gtid_gap_log_list, uuidSetFreeWrapper);
+    server.gtid_gaplog_entry_count = 0;
+    server.gap_log_size = 0;
+}
+
+
+
 void forceXsyncFullResync() {
     xsyncUuidInterestedSet(GTID_XSYNC_UUID_INTERESTED_FULLRESYNC);
 }
@@ -343,7 +551,8 @@ sds genGtidInfoString(sds info) {
             "gtid_uuid_interested:%s\r\n"
             "gtid_xsync_fullresync_indicator:%lld\r\n"
             "gtid_executed_cmd_count:%lld\r\n"
-            "gtid_ignored_cmd_count:%lld\r\n",
+            "gtid_ignored_cmd_count:%lld\r\n"
+            "gtid_gaplog_entries:%lld\r\n",
             server.uuid,
             master_uuid,
             gtid_set_repr,
@@ -364,7 +573,8 @@ sds genGtidInfoString(sds info) {
             server.gtid_uuid_interested,
             server.gtid_xsync_fullresync_indicator,
             server.gtid_executed_cmd_count,
-            server.gtid_ignored_cmd_count);
+            server.gtid_ignored_cmd_count,
+            server.gtid_gaplog_entry_count);
 
     sdsfree(gtid_set_repr);
     sdsfree(gtid_executed_repr);
@@ -425,6 +635,12 @@ void gtidxCommand(client *c) {
             "    Locate xsync continue position",
             "UUID-INTRESTED SET <*|?>",
             "    SET uuid.interested to * or ?",
+            "GAPLOG LEN",
+            "    Get gaplog entries count.",
+            "GAPLOG RANGE <uuid> <start> <end>",
+            "    Query gaplog entries by uuid and gno range.",
+            "GAPLOG CLEAR",
+            "    Clear all gaplog entries.",
             NULL
         };
         addReplyHelp(c, help);
@@ -593,6 +809,77 @@ void gtidxCommand(client *c) {
             }
         } else {
             addReplyError(c,"Syntax error");
+        }
+    } else if (!strcasecmp(c->argv[1]->ptr,"gaplog") && c->argc >= 3) {
+        /* GAPLOG子命令: LEN / RANGE / CLEAR */
+        if (!strcasecmp(c->argv[2]->ptr,"len") && c->argc == 3) {
+            addReplyLongLong(c, server.gtid_gaplog_entry_count);
+        } else if (!strcasecmp(c->argv[2]->ptr,"range") && c->argc == 6) {
+            /* GTIDX GAPLOG RANGE <uuid> <start_gno> <end_gno>
+             * 从 gtid_gap_log 字典中找到指定 uuid 的跳表，
+             * 遍历 [start_gno, end_gno] 范围的条目
+             * 返回数组: [gno, keys_infos, gno, keys_infos, ...] */
+            sds uuid = c->argv[3]->ptr;
+            long long start_gno, end_gno;
+            if (getLongLongFromObjectOrReply(c, c->argv[4], &start_gno, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[5], &end_gno, NULL) != C_OK) return;
+
+            /* 从字典中查找 uuid 对应的跳表 */
+            dictEntry *de = dictFind(server.gtid_gap_log, uuid);
+            if (de == NULL) {
+                addReplyArrayLen(c, 0);
+                return;
+            }
+            gaplogSkiplist *sl = dictGetVal(de);
+
+            /* 找到 start_gno 的第一个节点（利用跳表 O(log n) 定位） */
+            gaplogSkiplistNode *node = sl->header;
+            for (int i = sl->level - 1; i >= 0; i--) {
+                while (node->level[i].forward && node->level[i].forward->gno < start_gno)
+                    node = node->level[i].forward;
+            }
+            node = node->level[0].forward;
+
+            /* 先统计范围内条目数 */
+            long count = 0;
+            gaplogSkiplistNode *tmp = node;
+            while (tmp && tmp->gno <= end_gno) {
+                count++;
+                tmp = tmp->level[0].forward;
+            }
+
+            /* 返回格式: 每个条目返回 [gno, keys_infos]
+             * keys_infos 格式: [[dbid, key, [subkeys...]], ...] */
+            addReplyArrayLen(c, count * 2);
+            while (node && node->gno <= end_gno) {
+                /* 1. gno */
+                addReplyBulkLongLong(c, node->gno);
+
+                /* 2. keys_infos 数组 */
+                gtidGapLogKeysInfos *kis = node->keys_infos;
+                addReplyArrayLen(c, kis->size);
+                for (int i = 0; i < kis->size; i++) {
+                    gtidGapLogKeyInfo *ki = kis->keys[i];
+                    /* 每个 keyInfo: [dbid, key, [subkeys...]] */
+                    addReplyArrayLen(c, 3);
+                    addReplyBulkLongLong(c, ki->dbid);
+                    addReplyBulk(c, ki->key);
+                    addReplyArrayLen(c, ki->subkeys_count);
+                    for (int j = 0; j < ki->subkeys_count; j++) {
+                        addReplyBulk(c, ki->subkeys[j]);
+                    }
+                }
+                node = node->level[0].forward;
+            }
+        } else if (!strcasecmp(c->argv[2]->ptr,"clear") && c->argc == 3) {
+            /* 释放所有字典条目和 FIFO list 节点 */
+            dictEmpty(server.gtid_gap_log, NULL);
+            listEmpty(server.gtid_gap_log_list);
+            server.gtid_gaplog_entry_count = 0;
+            server.gap_log_size = 0;
+            addReply(c,shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
         }
     } else {
         addReplySubcommandSyntaxError(c);

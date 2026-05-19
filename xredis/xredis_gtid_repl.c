@@ -30,6 +30,8 @@
 #include <gtid.h>
 #include <ctype.h>
 
+/* gtidGapLogGnoEntry 已移除，改用 gaplogSkiplist（定义在 xredis_gtid.c 中） */
+
 int replicationSetupSlaveForXFullResync(client *slave, long long offset) {
     int ret = C_OK;
     sds gtid_lost_repr = NULL, repr = NULL;
@@ -1196,6 +1198,823 @@ static parsedSyncReply *parseSyncReply(sds reply) {
     return parsed;
 }
 
+/* ============================================================================
+ * Gaplog - 通过mock client复用processMultibulkBuffer解析backlog命令
+ * ============================================================================ */
+
+/* processMultibulkBuffer定义在networking.c，非static，linker可见 */
+extern int processMultibulkBuffer(client *c);
+
+/* 最大gaplog缓冲上限（1MB，足够容纳任何正常命令） */
+#define GAPLOG_MAX_BUF_SIZE (1024 * 1024)
+
+/* 清理mock client的argv和querybuf */
+static void mockClientCleanup(client *c) {
+    if (c->argv) {
+        for (int i = 0; i < c->argc; i++)
+            if (c->argv[i]) decrRefCount(c->argv[i]);
+        zfree(c->argv);
+    }
+    sdsfree(c->querybuf);
+}
+
+/* 解析后的单条命令（从mock client转移所有权） */
+typedef struct {
+    robj **argv;
+    int argc;
+    sds querybuf;  /* 用于robj->ptr引用的底层数据 */
+    size_t qb_pos; /* 命令在querybuf中的位置，用于计算下一个命令的偏移量 */
+} gtidParsedCmd;
+
+/* 解析后的多条命令列表（支持MULTI/EXEC事务） */
+typedef struct {
+    gtidParsedCmd *cmds;
+    int num_cmds;
+    int capacity;
+} gtidParsedCmdList;
+
+/* 从已解析的mock client转移命令所有权到gtidParsedCmdList
+ * 转移后客户端的argv/querybuf被置空，避免被mockClientCleanup double-free */
+static void gtidParsedCmdListAdd(gtidParsedCmdList *list, client *c) {
+    if (list->num_cmds >= list->capacity) {
+        list->capacity = list->capacity ? list->capacity * 2 : 8;
+        list->cmds = zrealloc(list->cmds,
+                              sizeof(gtidParsedCmd) * list->capacity);
+    }
+    gtidParsedCmd *cmd = &list->cmds[list->num_cmds++];
+    cmd->argv = c->argv;
+    cmd->argc = c->argc;
+    cmd->querybuf = c->querybuf;
+    cmd->qb_pos = c->qb_pos;  /* 保存命令位置，用于计算下一个命令偏移量 */
+    /* 转移所有权，防止后续mockClientCleanup double-free */
+    c->argv = NULL;
+    c->argc = 0;
+    c->querybuf = NULL;
+}
+
+/* 释放gtidParsedCmdList中的所有命令（类似mockClientCleanup的语义） */
+static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
+    for (int i = 0; i < list->num_cmds; i++) {
+        if (list->cmds[i].argv) {
+            for (int j = 0; j < list->cmds[i].argc; j++)
+                if (list->cmds[i].argv[j]) decrRefCount(list->cmds[i].argv[j]);
+            zfree(list->cmds[i].argv);
+        }
+        sdsfree(list->cmds[i].querybuf);
+    }
+    zfree(list->cmds);
+}
+
+/* 通过gtidSeq查找指定(uuid, gno)对应的backlog偏移量
+ * 遍历segment链表（从尾部开始），匹配uuid和gno范围
+ * 返回绝对偏移量，-1表示未找到 */
+static long long gtidSeqLookup(gtidSeq *seq, const char *uuid,
+                                size_t uuid_len, gno_t gno) {
+    if (seq == NULL) return -1;
+
+    gtidSegment *seg = seq->lastseg;
+    while (seg) {
+        if (seg->uuid_len == uuid_len &&
+            memcmp(seg->uuid, uuid, uuid_len) == 0 &&
+            gno >= seg->base_gno + (gno_t)seg->tgno &&
+            gno < seg->base_gno + (gno_t)seg->ngno) {
+            size_t idx = (size_t)(gno - seg->base_gno);
+            return seg->base_offset + seg->deltas[idx];
+        }
+        seg = seg->prev;
+    }
+    return -1;
+}
+
+/* 直接将 backlog 数据 append 到 sds，省掉中间临时 buf 的内存分配
+ * 输入：
+ *   offset  - backlog 中的绝对偏移量
+ *   dst     - 目标 sds（in/out），数据追加到末尾
+ *   size    - 希望读取的字节数（实际读取可能小于 size）
+ * 返回实际追加的字节数，-1 表示失败 */
+static ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size) {
+    if (server.repl_backlog == NULL || server.repl_backlog_histlen == 0)
+        return -1;
+
+    long long skip = offset - server.repl_backlog_off;
+    if (skip < 0 || skip >= server.repl_backlog_histlen) return -1;
+
+    long long available = server.repl_backlog_histlen - skip;
+    if (available <= 0) return -1;
+    if ((long long)size > available) size = (size_t)available;
+
+    /* 计算 offset 在环形缓冲区中的起始位置 */
+    long long j = (server.repl_backlog_idx +
+                   (server.repl_backlog_size - server.repl_backlog_histlen)) %
+                   server.repl_backlog_size;
+    j = (j + skip) % server.repl_backlog_size;
+
+    /* 为 sds 预留空间，一次性分配避免多次 realloc */
+    *dst = sdsMakeRoomFor(*dst, size);
+
+    /* 直接拷贝到 sds 末尾，处理环形缓冲区回绕 */
+    size_t total = 0;
+    while (total < size) {
+        size_t thislen = server.repl_backlog_size - j;
+        if (thislen > size - total) thislen = size - total;
+        memcpy((*dst) + sdslen(*dst) + total, server.repl_backlog + j, thislen);
+        total += thislen;
+        j = 0;
+    }
+    /* 手动更新 sds 长度（sdsMakeRoomFor 不更新长度） */
+    sdsIncrLen(*dst, (int)total);
+    return (ssize_t)total;
+}
+
+/* 从backlog offset读取一个GTID包装的命令，通过mock client+processMultibulkBuffer解析
+ *
+ * 尝试从8KB开始读取，数据不足时缓冲区翻倍重试，最大GAPLOG_MAX_BUF_SIZE
+ * 返回0成功，-1失败（backlog覆盖/协议错误）
+ * 成功时*mock已填充（调用者负责mockClientCleanup）
+ * 内部的原始缓冲区在解析成功后即刻释放（数据已拷贝到mock->querybuf） */
+/* 从 backlog 解析 GTID 命令
+ * 如果遇到 SELECT 命令，跳过它并继续解析下一个命令
+ *
+ * 输入：
+ *   offset   - backlog 中的绝对偏移量
+ *   mock     - 输出：解析结果填入此 mock client（调用者负责 mockClientCleanup）
+ *   cmd_len  - 输出：本次解析消耗的字节数（包含跳过的 SELECT），NULL 则不输出
+ * 返回 0 成功，-1 失败 */
+static int parseGtidCmdFromBacklog(long long offset, client *mock, size_t *cmd_len) {
+    size_t read_size = 8192;
+
+    while (read_size <= GAPLOG_MAX_BUF_SIZE) {
+        /* 直接将 backlog 数据 append 到 querybuf，省掉中间临时 buf */
+        memset(mock, 0, sizeof(*mock));
+        mock->querybuf = sdsempty();
+        mock->authenticated = 1;
+
+        ssize_t nread = backlogAppendToSds(offset, &mock->querybuf, read_size);
+        if (nread <= 0) {
+            serverLog(LL_WARNING, "[gaplog] backlogAppendToSds failed at offset %lld, nread=%zd",
+                      offset, nread);
+            return -1;
+        }
+
+        /* 循环解析，跳过 SELECT 命令 */
+        size_t consumed = 0;  /* 已消耗的字节数（含跳过的 SELECT） */
+        while (mock->qb_pos < sdslen(mock->querybuf)) {
+            /* 先释放之前解析的 argv（如果有） */
+            if (mock->argv) {
+                for (int j = 0; j < mock->argc; j++) decrRefCount(mock->argv[j]);
+                zfree(mock->argv);
+                mock->argv = NULL;
+            }
+            /* 重置 argc 和 multibulklen 以解析下一个命令 */
+            mock->argc = 0;
+            mock->multibulklen = 0;
+            mock->bulklen = -1;
+
+            /* 记录解析前 querybuf 总长和 qb_pos，用于计算本次命令消耗字节数
+             * 注意：processMultibulkBuffer 内部可能触发 querybuf trim（qb_pos 归零），
+             * 需要同时记录 before_len 和 before_qb_pos 才能正确计算步进量 */
+            size_t before_len = sdslen(mock->querybuf);
+            size_t before_qb_pos = mock->qb_pos;
+
+            if (processMultibulkBuffer(mock) != C_OK) {
+                /* 协议错误（非数据不足），放弃 */
+                if (mock->flags & CLIENT_PROTOCOL_ERROR) {
+                    serverLog(LL_WARNING, "[gaplog] protocol error at offset %lld, qb_pos=%zu, flags=%lu",
+                              offset, mock->qb_pos, (unsigned long)mock->flags);
+                    return -1;
+                }
+                /* 数据不足，需要更大的 buffer */
+                break;
+            }
+
+            /* 本次命令消耗字节数：
+             * 无 trim：qb_pos_after - qb_pos_before
+             * 有 trim：(before_len - qb_pos_before) - (sdslen_after - qb_pos_after)
+             *          即"解析前剩余字节" - "解析后剩余字节" */
+            size_t remaining_before = before_len - before_qb_pos;
+            size_t remaining_after = sdslen(mock->querybuf) - mock->qb_pos;
+            size_t this_cmd_len = remaining_before - remaining_after;
+
+            /* 检查是否是 SELECT 命令 */
+            if (mock->argc >= 1 && mock->argv[0] != NULL) {
+                sds cmd = (sds)mock->argv[0]->ptr;
+                if (!strcasecmp(cmd, "select")) {
+                    consumed += this_cmd_len;
+                    /* 释放 SELECT 命令的 argv，继续解析下一个命令 */
+                    for (int j = 0; j < mock->argc; j++) decrRefCount(mock->argv[j]);
+                    zfree(mock->argv);
+                    mock->argv = NULL;
+                    mock->argc = 0;
+                    continue;
+                }
+            }
+
+            /* 不是 SELECT，找到了目标命令 */
+            consumed += this_cmd_len;
+            if (cmd_len) *cmd_len = consumed;
+            return 0;
+        }
+
+        mockClientCleanup(mock);
+        read_size *= 2;
+    }
+
+    return -1;
+}
+
+/* 从 backlog 解析命令（不跳过 SELECT）
+ * 用于 parseMultiCommand 解析 MULTI 内部命令
+ *
+ * 输入：
+ *   offset   - backlog 中的绝对偏移量
+ *   mock     - 输出：解析结果填入此 mock client（调用者负责 mockClientCleanup）
+ *   cmd_len  - 输出：本次解析消耗的字节数，NULL 则不输出
+ * 返回 0 成功，-1 失败 */
+static int parseCmdFromBacklogNoSkip(long long offset, client *mock, size_t *cmd_len) {
+    size_t read_size = 8192;
+    size_t total_read = 0;  /* 已读取的总字节数 */
+
+    /* 初始化 mock client */
+    memset(mock, 0, sizeof(*mock));
+    mock->querybuf = sdsempty();
+    mock->authenticated = 1;
+
+    while (read_size <= GAPLOG_MAX_BUF_SIZE) {
+        /* 直接将更多 backlog 数据 append 到 querybuf */
+        ssize_t nread = backlogAppendToSds(offset + total_read, &mock->querybuf, read_size);
+        if (nread <= 0) {
+            serverLog(LL_WARNING, "[gaplog] backlogAppendToSds failed at offset %lld, nread=%zd",
+                      offset + total_read, nread);
+            return -1;
+        }
+        total_read += nread;
+
+        /* 尝试解析命令 */
+        while (mock->qb_pos < sdslen(mock->querybuf)) {
+            /* 如果还没有开始解析新命令，重置状态 */
+            if (mock->multibulklen == 0 && mock->argc == 0) {
+                if (mock->argv) {
+                    for (int j = 0; j < mock->argc; j++) decrRefCount(mock->argv[j]);
+                    zfree(mock->argv);
+                    mock->argv = NULL;
+                }
+                mock->argc = 0;
+                mock->bulklen = -1;
+            }
+
+            if (processMultibulkBuffer(mock) != C_OK) {
+                /* 协议错误（非数据不足），放弃 */
+                if (mock->flags & CLIENT_PROTOCOL_ERROR) {
+                    serverLog(LL_WARNING, "[gaplog] protocol error at offset %lld, qb_pos=%zu, flags=%lu",
+                              offset, mock->qb_pos, (unsigned long)mock->flags);
+                    return -1;
+                }
+                /* 数据不足，需要读取更多数据 */
+                break;
+            }
+
+            /* consumed = 本轮总读入字节 - querybuf 中未解析剩余字节
+             * 等价于从 offset 到命令结束的字节数，兼容多轮读取和 trim 场景 */
+            size_t consumed = total_read - (sdslen(mock->querybuf) - mock->qb_pos);
+            if (cmd_len) *cmd_len = consumed;
+            return 0;
+        }
+
+        /* 数据不足，翻倍读取大小继续读取 */
+        read_size *= 2;
+    }
+
+    mockClientCleanup(mock);
+    return -1;
+}
+
+/* 从命令参数中提取 key/subkey 信息，直接添加到 gtidGapLogKeysInfos
+ *
+ * args[0] = 命令名, args[1] = key, args[2..] = 其他参数
+ * kis: 目标 gtidGapLogKeysInfos
+ * dbid: 数据库编号
+ *
+ * 支持的命令格式：
+ *   - 普通命令（SET, LPUSH等）: 单个 key
+ *   - Hash命令（HSET key f1 v1 f2 v2）: key + fields 作为 subkeys
+ *   - Set命令（SADD key member1 member2）: key + members 作为 subkeys
+ *   - Sorted Set命令（ZADD key score member）: key + members 作为 subkeys
+ *   - 多key命令（DEL key1 key2）: 每个 key 作为独立条目
+ */
+static void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc) {
+    if (argc < 2 || kis == NULL) return;
+
+    sds cmd = (sds)args[0]->ptr;
+
+    /* === 多key命令: DEL/EXISTS/UNLINK key1 key2 ... ===
+     * 每个 key 作为独立条目添加 */
+    if (!strcasecmp(cmd, "del") || !strcasecmp(cmd, "exists") ||
+        !strcasecmp(cmd, "unlink") || !strcasecmp(cmd, "mget")) {
+        for (int i = 1; i < argc; i++) {
+            robj *key_obj = createStringObject((sds)args[i]->ptr, sdslen((sds)args[i]->ptr));
+            gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, NULL, 0);
+            decrRefCount(key_obj);
+            kis->size++;
+            kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+            kis->keys[kis->size - 1] = ki;
+        }
+        return;
+    }
+
+    /* === MSET: key1 v1 key2 v2 ... (keys在奇数位置) ===
+     * 每个 key 作为独立条目添加 */
+    if (!strcasecmp(cmd, "mset")) {
+        for (int i = 1; i < argc; i += 2) {
+            robj *key_obj = createStringObject((sds)args[i]->ptr, sdslen((sds)args[i]->ptr));
+            gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, NULL, 0);
+            decrRefCount(key_obj);
+            kis->size++;
+            kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+            kis->keys[kis->size - 1] = ki;
+        }
+        return;
+    }
+
+    /* === HSET/HMSET: key f1 v1 f2 v2 ... (fields在奇数位置) === */
+    if (!strcasecmp(cmd, "hset") || !strcasecmp(cmd, "hmset")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        int subkeys_count = (argc - 2) / 2;
+        robj **subkeys = NULL;
+        if (subkeys_count > 0) {
+            subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+            for (int i = 0; i < subkeys_count; i++) {
+                subkeys[i] = createStringObject((sds)args[2 + i * 2]->ptr, sdslen((sds)args[2 + i * 2]->ptr));
+            }
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        for (int i = 0; i < subkeys_count; i++) decrRefCount(subkeys[i]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === HDEL/HEXISTS/HMGET: key f1 f2 ... (fields在连续位置) === */
+    if (!strcasecmp(cmd, "hdel") || !strcasecmp(cmd, "hexists") ||
+        !strcasecmp(cmd, "hmget")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        int subkeys_count = argc - 2;
+        robj **subkeys = NULL;
+        if (subkeys_count > 0) {
+            subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+            for (int i = 0; i < subkeys_count; i++) {
+                subkeys[i] = createStringObject((sds)args[2 + i]->ptr, sdslen((sds)args[2 + i]->ptr));
+            }
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        for (int i = 0; i < subkeys_count; i++) decrRefCount(subkeys[i]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === 单field Hash命令: HGET/HSETNX/HINCRBY/HINCRBYFLOAT key field === */
+    if (!strcasecmp(cmd, "hget") || !strcasecmp(cmd, "hsetnx") ||
+        !strcasecmp(cmd, "hincrby") || !strcasecmp(cmd, "hincrbyfloat") ||
+        !strcasecmp(cmd, "hlen")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        robj **subkeys = NULL;
+        int subkeys_count = 0;
+        if (argc >= 3) {
+            subkeys_count = 1;
+            subkeys = zmalloc(sizeof(robj*));
+            subkeys[0] = createStringObject((sds)args[2]->ptr, sdslen((sds)args[2]->ptr));
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        if (subkeys) decrRefCount(subkeys[0]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === Set命令: SADD/SREM key member1 member2 ... === */
+    if (!strcasecmp(cmd, "sadd") || !strcasecmp(cmd, "srem")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        int subkeys_count = argc - 2;
+        robj **subkeys = NULL;
+        if (subkeys_count > 0) {
+            subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+            for (int i = 0; i < subkeys_count; i++) {
+                subkeys[i] = createStringObject((sds)args[2 + i]->ptr, sdslen((sds)args[2 + i]->ptr));
+            }
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        for (int i = 0; i < subkeys_count; i++) decrRefCount(subkeys[i]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === Sorted Set命令: ZADD key score1 member1 score2 member2 ... === */
+    if (!strcasecmp(cmd, "zadd")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        /* ZADD格式: ZADD key [NX|XX] [CH] [INCR] score member [score member ...]
+         * 需要跳过可选参数NX/XX/CH/INCR */
+        int i = 2;
+        while (i < argc) {
+            sds arg = (sds)args[i]->ptr;
+            if (!strcasecmp(arg, "nx") || !strcasecmp(arg, "xx") ||
+                !strcasecmp(arg, "ch") || !strcasecmp(arg, "incr")) {
+                i++;
+            } else {
+                break;
+            }
+        }
+        /* 现在 i 指向第一个 score，之后是 member */
+        int subkeys_count = (argc - i) / 2;
+        robj **subkeys = NULL;
+        if (subkeys_count > 0) {
+            subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+            for (int j = 0; j < subkeys_count; j++) {
+                subkeys[j] = createStringObject((sds)args[i + 1 + j * 2]->ptr, sdslen((sds)args[i + 1 + j * 2]->ptr));
+            }
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        for (int j = 0; j < subkeys_count; j++) decrRefCount(subkeys[j]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === ZREM key member1 member2 ... === */
+    if (!strcasecmp(cmd, "zrem")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        int subkeys_count = argc - 2;
+        robj **subkeys = NULL;
+        if (subkeys_count > 0) {
+            subkeys = zmalloc(sizeof(robj*) * subkeys_count);
+            for (int i = 0; i < subkeys_count; i++) {
+                subkeys[i] = createStringObject((sds)args[2 + i]->ptr, sdslen((sds)args[2 + i]->ptr));
+            }
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        for (int i = 0; i < subkeys_count; i++) decrRefCount(subkeys[i]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === ZINCRBY key increment member === */
+    if (!strcasecmp(cmd, "zincrby")) {
+        robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+        robj **subkeys = NULL;
+        int subkeys_count = 0;
+        if (argc >= 4) {
+            subkeys_count = 1;
+            subkeys = zmalloc(sizeof(robj*));
+            subkeys[0] = createStringObject((sds)args[3]->ptr, sdslen((sds)args[3]->ptr));
+        }
+        gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, subkeys, subkeys_count);
+        decrRefCount(key_obj);
+        if (subkeys) decrRefCount(subkeys[0]);
+        zfree(subkeys);
+        kis->size++;
+        kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+        kis->keys[kis->size - 1] = ki;
+        return;
+    }
+
+    /* === 其他所有命令：第一个参数是key，无 subkey === */
+    robj *key_obj = createStringObject((sds)args[1]->ptr, sdslen((sds)args[1]->ptr));
+    gtidGapLogKeyInfo *ki = gtidGapLogKeyInfoCreate(dbid, key_obj, NULL, 0);
+    decrRefCount(key_obj);
+    kis->size++;
+    kis->keys = zrealloc(kis->keys, sizeof(gtidGapLogKeyInfo*) * kis->size);
+    kis->keys[kis->size - 1] = ki;
+}
+
+/* =====================================================
+ * Gaplog 解析辅助函数
+ * ===================================================== */
+
+/**
+ * 解析普通 GTID 包装的命令
+ * GTID 格式: GTID <uuid:gno> <dbid> <command> [args...]
+ *
+ * 参数:
+ *   mock - 已解析的 mock client
+ *   kis  - 用于存储 key 信息的结构
+ * 返回:
+ *   0 成功, -1 失败
+ */
+static int parseGtidCommand(client *mock, gtidGapLogKeysInfos *kis) {
+    int dbid = 0;
+
+    /* 安全检查：GTID 命令格式: GTID <uuid:gno> <dbid> <command> [args...] */
+    if (mock->argc < 4 || mock->argv == NULL || mock->argv[2] == NULL) {
+        serverLog(LL_WARNING, "[gaplog] invalid GTID command, argc=%d", mock->argc);
+        return -1;
+    }
+
+    getLongLongFromObject(mock->argv[2], (long long*)&dbid);
+
+    /* 跳过 GTID 头部（argv[0]=GTID, argv[1]=uuid:gno, argv[2]=dbid） */
+    addKeyInfoToKeysInfos(kis, dbid, mock->argv + 3, mock->argc - 3);
+    return 0;
+}
+
+/**
+ * 解析 MULTI/EXEC 事务命令
+ * backlog 格式: MULTI -> [SELECT db] -> [SET k v]... -> GTID <uuid:gno> <dbid> EXEC
+ *
+ * 注意: 调用此函数时，mock 已经解析了 MULTI 命令
+ *
+ * 解析流程:
+ * 1. 从 MULTI 之后开始解析命令，直到 GTID EXEC
+ * 2. 使用 select_dbid 作为初始 dbid（如果有），否则从 GTID EXEC 获取
+ * 3. 遍历所有命令，如果有 SELECT 就更新 dbid
+ *
+ * 参数:
+ *   mock            - 已解析 MULTI 命令的 mock client
+ *   multi_end_off   - MULTI 命令结束后的 backlog 偏移量（即第一条内部命令的起始位置）
+ *   select_dbid     - MULTI 前面的 SELECT 命令记录的 dbid（-1 表示没有）
+ *   kis             - 用于存储 key 信息的结构
+ * 返回:
+ *   0 成功, -1 失败
+ */
+static int parseMultiCommand(long long multi_end_off, long long select_dbid, gtidGapLogKeysInfos *kis) {
+    long long next_off = multi_end_off;
+
+    /* 解析所有命令，收集到列表中 */
+    gtidParsedCmdList cmdlist = {0};
+
+    while (1) {
+        client inner_c;
+        size_t inner_cmd_len = 0;
+        if (parseCmdFromBacklogNoSkip(next_off, &inner_c, &inner_cmd_len) < 0)
+            break;
+
+        if (inner_c.argc < 1 || inner_c.argv == NULL || inner_c.argv[0] == NULL) {
+            break;
+        }
+
+        /* 检查是否是 GTID EXEC */
+        sds inner_cmd = (sds)inner_c.argv[0]->ptr;
+        int is_gtid_wrapped = !strcasecmp(inner_cmd, "gtid");
+        sds actual_cmd_name = inner_cmd;
+
+        if (is_gtid_wrapped && inner_c.argc >= 4 && inner_c.argv[3] != NULL) {
+            actual_cmd_name = (sds)inner_c.argv[3]->ptr;
+        }
+
+        int is_exec = !strcasecmp(actual_cmd_name, "exec");
+
+        /* 添加到命令列表 */
+        gtidParsedCmdListAdd(&cmdlist, &inner_c);
+
+        if (is_exec) {
+            break;  /* 到达 EXEC，停止解析 */
+        }
+        next_off += inner_cmd_len;
+    }
+
+    if (cmdlist.num_cmds == 0) {
+        return -1;
+    }
+
+    /* 获取初始 dbid：优先使用 select_dbid，否则从 GTID EXEC 获取 */
+    int dbid = 0;
+    if (select_dbid >= 0) {
+        dbid = (int)select_dbid;
+    } else {
+        gtidParsedCmd *last_cmd = &cmdlist.cmds[cmdlist.num_cmds - 1];
+        if (last_cmd->argv != NULL && last_cmd->argv[0] != NULL) {
+            sds last_cmd_name = (sds)last_cmd->argv[0]->ptr;
+            if (!strcasecmp(last_cmd_name, "gtid") && last_cmd->argc >= 3 && last_cmd->argv[2] != NULL) {
+                getLongLongFromObject(last_cmd->argv[2], (long long*)&dbid);
+            }
+        }
+    }
+
+    /* 第二遍：处理所有命令（跳过最后一个 EXEC），生成 keyinfos */
+    for (int i = 0; i < cmdlist.num_cmds - 1; i++) {
+        gtidParsedCmd *cmd = &cmdlist.cmds[i];
+        if (cmd->argv == NULL || cmd->argv[0] == NULL) continue;
+
+        sds cmd_name = (sds)cmd->argv[0]->ptr;
+
+        /* SELECT 命令更新 dbid */
+        if (!strcasecmp(cmd_name, "select") && cmd->argc >= 2 && cmd->argv[1] != NULL) {
+            getLongLongFromObject(cmd->argv[1], (long long*)&dbid);
+            continue;
+        }
+
+        /* 非 SELECT 命令，提取 keys */
+        addKeyInfoToKeysInfos(kis, dbid, cmd->argv, cmd->argc);
+    }
+
+    gtidParsedCmdListCleanup(&cmdlist);
+    return 0;
+}
+
+/**
+ * 保存 gaplog 条目到数据结构
+ *
+ * 参数:
+ *   uuid     - GTID 的 uuid
+ *   uuid_len - uuid 长度
+ *   gno      - GTID 的 gno
+ *   kis      - key 信息结构
+ * 返回:
+ *   0 成功, -1 失败
+ */
+static int saveGapLogEntry(char *uuid, size_t uuid_len, gno_t gno, gtidGapLogKeysInfos *kis) {
+    if (kis->size == 0) return 0;
+
+    sds uuid_sds = sdsnewlen(uuid, uuid_len);
+
+    /* 1. 处理 gtid_gap_log_list (FIFO 顺序) */
+    uuidSet *last_uuid_set = NULL;
+    listNode *tail_ln = listLast(server.gtid_gap_log_list);
+    if (tail_ln != NULL) {
+        last_uuid_set = (uuidSet*)listNodeValue(tail_ln);
+        if (last_uuid_set->uuid_len != uuid_len ||
+            memcmp(last_uuid_set->uuid, uuid, uuid_len) != 0) {
+            last_uuid_set = NULL;
+        }
+    }
+
+    if (last_uuid_set != NULL) {
+        uuidSetAdd(last_uuid_set, gno, gno);
+    } else {
+        uuidSet *new_uuid_set = uuidSetNew(uuid, uuid_len);
+        uuidSetAdd(new_uuid_set, gno, gno);
+        listAddNodeTail(server.gtid_gap_log_list, new_uuid_set);
+    }
+
+    /* 2. 处理 gtid_gap_log 字典 (skiplist 按 gno 升序存储) */
+    dictEntry *de = dictFind(server.gtid_gap_log, uuid_sds);
+    gaplogSkiplist *sl;
+    if (de == NULL) {
+        sl = gaplogSkiplistCreate();
+        sds uuid_key = sdsdup(uuid_sds);
+        dictAdd(server.gtid_gap_log, uuid_key, sl);
+    } else {
+        sl = dictGetVal(de);
+    }
+
+    /* skiplist 按 gno 有序插入，O(log n) */
+    gaplogSkiplistInsert(sl, gno, kis);
+
+    sdsfree(uuid_sds);
+    server.gtid_gaplog_entry_count++;
+    return 0;
+}
+
+/**
+ * 逐出最老的 gaplog 条目（FIFO 策略）
+ *
+ * 返回:
+ *   逐出的条目数
+ */
+static int evictOldestGapLogEntry(void) {
+    listNode *first_ln = listFirst(server.gtid_gap_log_list);
+    if (first_ln == NULL) return 0;
+
+    uuidSet *first_uuid_set = (uuidSet*)listNodeValue(first_ln);
+
+    /* 从 uuidSet 中获取最小 gno */
+    gno_t min_gno = uuidSetNext(first_uuid_set, 0);
+    if (min_gno == 0) {
+        /* uuidSet 为空，删除整个 node */
+        listDelNode(server.gtid_gap_log_list, first_ln);
+        return 0;
+    }
+
+    /* 从 uuidSet 中删除最小 gno */
+    uuidSetRemove(first_uuid_set, min_gno, min_gno);
+
+    /* 从 gtid_gap_log 字典中删除 min_gno 对应的 skiplist 节点 */
+    sds evict_uuid_sds = sdsnewlen(first_uuid_set->uuid, first_uuid_set->uuid_len);
+    dictEntry *de = dictFind(server.gtid_gap_log, evict_uuid_sds);
+    if (de != NULL) {
+        gaplogSkiplist *sl = dictGetVal(de);
+        gaplogSkiplistDelete(sl, min_gno);
+        /* 如果跳表为空，删除字典条目 */
+        if (sl->length == 0) {
+            dictDelete(server.gtid_gap_log, evict_uuid_sds);
+        }
+    }
+    sdsfree(evict_uuid_sds);
+
+    /* 如果 uuidSet 为空，删除整个 node */
+    if (uuidSetCount(first_uuid_set) == 0) {
+        listDelNode(server.gtid_gap_log_list, first_ln);
+    }
+
+    server.gtid_gaplog_entry_count--;
+    return 1;
+}
+
+void saveGapLogFromGtidSet(gtidSet *mlost) {
+    if (mlost == NULL || server.gtid_seq == NULL) return;
+    if (server.gtid_gap_log_list == NULL) return;
+
+    size_t saved_count = 0;
+    uuidSet *us = mlost->header;
+
+    while (us) {
+        gtidIntervalNode *node = us->intervals->header->forwards[0];
+        while (node) {
+            for (gno_t gno = node->start; gno <= node->end; gno++) {
+                /* 1. 通过gtidSeq查找backlog偏移量 */
+                long long offset = gtidSeqLookup(server.gtid_seq, us->uuid,
+                                                  us->uuid_len, gno);
+                if (offset < 0) continue;
+
+                /* 2. 解析backlog命令，可能需要跳过 SELECT 找到 MULTI */
+                client mock;
+                long long cur_offset = offset;
+                int dbid_from_select = -1;  /* SELECT 命令记录的 dbid */
+                /* 3. 创建 keys_infos 结构 */
+                gtidGapLogKeysInfos *kis = gtidGapLogKeysInfosCreate();
+
+                while (1) {
+                    size_t cur_cmd_len = 0;
+                    if (parseGtidCmdFromBacklog(cur_offset, &mock, &cur_cmd_len) < 0) {
+                        break;
+                    }
+                    if (mock.argc < 1 || mock.argv == NULL || mock.argv[0] == NULL) {
+                        break;
+                    }
+
+                    sds cmd_name = (sds)mock.argv[0]->ptr;
+
+                    /* SELECT 命令：记录 dbid，继续解析下一个命令 */
+                    if (!strcasecmp(cmd_name, "select") && mock.argc >= 2) {
+                        getLongLongFromObject(mock.argv[1], (long long*)&dbid_from_select);
+                        cur_offset = cur_offset + cur_cmd_len;
+                        continue;
+                    }
+
+                    /* MULTI 命令：正确入口 */
+                    if (!strcasecmp(cmd_name, "multi")) {
+                        /* 4. 调用 parseMultiCommand 解析 MULTI 事务
+                         * MULTI 之后的第一条命令在 cur_offset + cur_cmd_len */
+                        parseMultiCommand(cur_offset + cur_cmd_len, dbid_from_select, kis);
+                        break;
+                    }
+
+                    /* 处理GTID 命令 */
+                    if (!strcasecmp(cmd_name, "gtid")) {
+                        serverAssert(dbid_from_select == -1);
+                        parseGtidCommand(&mock, kis);
+                        break;
+                    }
+
+                    /* 其他命令：不应该出现 */
+                    serverLog(LL_WARNING, "[gaplog] unexpected command '%s' at offset %lld, expected SELECT or MULTI", cmd_name, cur_offset);
+                    mockClientCleanup(&mock);
+                    serverAssert("gtidSeqLookup error" && 0);
+                }
+
+                mockClientCleanup(&mock);
+
+                /* 5. 保存到 gaplog 数据结构 */
+                if (kis->size > 0) {
+                    saveGapLogEntry(us->uuid, us->uuid_len, gno, kis);
+                    saved_count++;
+
+                    /* 6. FIFO逐出: 若超过最大条目数,从最旧的开始逐出 */
+                    while (server.gtid_gaplog_entry_count > (long long)server.gtid_xsync_max_gap) {
+                        evictOldestGapLogEntry();
+                    }
+                } else {
+                    gtidGapLogKeysInfosFree(kis);
+                }
+            }
+            node = node->forwards[0];
+        }
+        us = us->next;
+    }
+
+    if (saved_count > 0) {
+        serverLog(LL_NOTICE, "[gaplog] saved %zu gap log entries from %llu lost GTIDs",
+                  saved_count, (unsigned long long)gtidSetCount(mlost));
+    }
+}
 int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
     int result = PSYNC_BY_REDIS;
 
@@ -1313,7 +2132,7 @@ int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
                     "[xsync] Successful partial xsync with master: %s", reply);
 
             gtidSet *gtid_cont = parsed->xcontinue.gtid_cont;
-            gtidSet *gtid_slost = NULL, *gtid_slave = NULL;
+            gtidSet *gtid_slost = NULL, *gtid_slave = NULL, *gtid_mlost = NULL;
             sds gtid_cont_repr, gtid_slave_repr, gtid_slost_repr;
 
             gtid_slave = serverGtidSetGet("[xsync]");
@@ -1325,6 +2144,15 @@ int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
             serverLog(LL_NOTICE, "[xsync] gtid.set-slost(%s) = "
                     "gtid.set-continue(%s) - gtid.set-slave(%s)",
                     gtid_slost_repr,gtid_cont_repr,gtid_slave_repr);
+            gtid_mlost = gtidSetDup(gtid_slave);
+            gtidSetDiff(gtid_mlost, gtid_cont);
+            sds gtid_mlost_repr = gtidSetDump(gtid_mlost);
+            serverLog(LL_WARNING, "[gaplog] gtid_mlost = %s, count = %d",
+                      gtid_mlost_repr, (int)gtidSetCount(gtid_mlost));
+            sdsfree(gtid_mlost_repr);
+            if (gtidSetCount(gtid_mlost) > 0) {
+                saveGapLogFromGtidSet(gtid_mlost);
+            }
 
             /* Update gtid lost, master.uuid or replid/reploff. */
             serverReplStreamUpdateXsync(gtid_slost,NULL,
@@ -1335,7 +2163,7 @@ int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
 
             sdsfree(gtid_cont_repr), sdsfree(gtid_slave_repr),
                 sdsfree(gtid_slost_repr);
-            gtidSetFree(gtid_slost), gtidSetFree(gtid_slave);
+            gtidSetFree(gtid_slost), gtidSetFree(gtid_slave), gtidSetFree(gtid_mlost);
 
             result = PSYNC_CONTINUE;
         }

@@ -39,6 +39,8 @@ typedef struct client client;
 typedef struct redisObject robj;
 typedef struct _rio rio;
 
+uint64_t dictStringHash(const void *key); // in latency.c
+
 /* Misc */
 int isGtidExecCommand(client *c);
 sds gtidSetDump(gtidSet *gtid_set);
@@ -254,6 +256,55 @@ sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv);
 long long addReplyReplicationBacklog(client *c, long long offset);
 void afterErrorReply(client *c, const char *s, size_t len);
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
+
+
+typedef struct gtidGapLogKeyInfo {
+    int dbid;
+    struct redisObject* key;
+    struct redisObject** subkeys;
+    int subkeys_count;
+} gtidGapLogKeyInfo;
+
+typedef struct gtidGapLogKeysInfos {
+    gtidGapLogKeyInfo** keys;
+    int size;
+} gtidGapLogKeysInfos;
+
+/* ========== gaplogSkiplist: 以 gno 为 key 的跳表，用于 gtid_gap_log 字典的 value ========== */
+/* 跳表最大层数 */
+#define GAPLOG_SKIPLIST_MAXLEVEL 16
+
+/* 跳表节点：每个节点保存一个 (gno, keys_infos) 对 */
+typedef struct gaplogSkiplistNode {
+    long long gno;                      /* 序号，作为排序 key */
+    gtidGapLogKeysInfos *keys_infos;    /* 对应的 key 信息 */
+    struct gaplogSkiplistNode *backward;/* 后向指针（最底层，用于反向遍历） */
+    struct {
+        struct gaplogSkiplistNode *forward; /* 前向指针 */
+    } level[]; /* 柔性数组，按实际层数分配 */
+} gaplogSkiplistNode;
+
+/* 跳表头部 */
+typedef struct gaplogSkiplist {
+    gaplogSkiplistNode *header; /* 哨兵头节点，不存数据 */
+    gaplogSkiplistNode *tail;   /* 尾节点，方便 O(1) 访问最大 gno */
+    unsigned long length;       /* 节点数量（不含 header） */
+    int level;                  /* 当前最高层数 */
+} gaplogSkiplist;
+
+/* skiplist 操作接口 */
+gaplogSkiplist *gaplogSkiplistCreate(void);
+void gaplogSkiplistFree(gaplogSkiplist *sl);
+void gaplogSkiplistInsert(gaplogSkiplist *sl, long long gno, gtidGapLogKeysInfos *keys_infos);
+int gaplogSkiplistDelete(gaplogSkiplist *sl, long long gno);
+/* 返回 gno 最小的节点（不含 header），NULL 表示空 */
+gaplogSkiplistNode *gaplogSkiplistFirst(gaplogSkiplist *sl);
+
+void gtidGapLogInit();
+gtidGapLogKeysInfos *gtidGapLogKeysInfosCreate();
+void gtidGapLogKeysInfosFree(gtidGapLogKeysInfos *kis);
+gtidGapLogKeyInfo *gtidGapLogKeyInfoCreate(int dbid, robj *key, robj **subkeys, int subkeys_count);
+void gtidGapLogKeyInfoFree(gtidGapLogKeyInfo *ki);
 
 int gtidTest(int argc, char **argv, int accurate);
 
