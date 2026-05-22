@@ -34,6 +34,7 @@
 #include "adlist.h"
 #include "connection.h"
 #include "gtid.h"
+#include "dict.h"
 
 typedef struct client client;
 typedef struct redisObject robj;
@@ -255,6 +256,48 @@ long long addReplyReplicationBacklog(client *c, long long offset);
 void afterErrorReply(client *c, const char *s, size_t len);
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
 
+#define OBJ_UNKNOWN 255
+/* gapLog functions and structs */
+typedef struct gtidGapLogKeyInfo {
+  unsigned long long dbid:4;      /* max 16 db */
+  unsigned long long key_type:4;  /* OBJ_STRING/OBJ_LIST/OBJ_SET/OBJ_ZSET/OBJ_HASH */
+  unsigned long long subkeys_count:56;
+  sds key;                        /* key (sdsdup ) */
+  sds* subkeys;                   /* subkeys (sdsdup ) */
+} gtidGapLogKeyInfo;
+
+typedef struct gtidGapLogKeysInfos {
+    gtidGapLogKeyInfo** keys;
+    size_t size;
+} gtidGapLogKeysInfos;
+
+typedef struct gtidGapLog {
+  dict* data;           //dict<uuid, skiplist<gtidGapLogKeyInfo>>
+  list* history;   //list<uuidSet>
+  size_t size;  
+} gtidGapLog;
+
+gtidGapLog* createGtidGapLog(void);
+void resetGtidGapLog(gtidGapLog* gtid_gap_log);
+void freeGtidGapLog(gtidGapLog* gaplog);
+
+gtidGapLogKeysInfos* createGtidGapLogKeysInfos(int max_size);
+void freeGtidGapLogKeysInfos(void* gtid_gap_log_keys_infos);
+
+gtidGapLogKeyInfo* createGtidGapLogKeyInfo(int dbid, int type, sds key, sds* subkeys, int subkeys_count);
+void freeGtidGapLogKeyInfo(gtidGapLogKeyInfo* gtid_gap_log_key_info);
+
+
+int processMultibulkBuffer(client* c);
+
+
+/*  adaptation for version diff */
+/* backlog data copy to buffer (version)*/
+ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size);
+void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc);
+
+
+/* gtid test */
 int gtidTest(int argc, char **argv, int accurate);
 
 #endif
