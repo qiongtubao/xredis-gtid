@@ -260,7 +260,12 @@ long long addReplyReplicationBacklog(client *c, long long offset);
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
 
 #define OBJ_UNKNOWN 255
-/* gapLog functions and structs */
+
+#include "xredis_cmdparse.h"
+
+/* ================================================================
+ * gapLog functions and structs
+ * ================================================================ */
 typedef struct gtidGapLogKeyInfo {
   unsigned long long dbid:4;      /* max 16 db */
   unsigned long long key_type:4;  /* OBJ_STRING/OBJ_LIST/OBJ_SET/OBJ_ZSET/OBJ_HASH */

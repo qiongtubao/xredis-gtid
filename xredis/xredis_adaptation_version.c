@@ -1,5 +1,6 @@
 #include "server.h"
-
+#include "xredis_gtid.h"
+#include "xredis_cmdparse.h"
 
 /* version 6.x*/
 
@@ -33,6 +34,17 @@ ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size) {
     return (ssize_t)total;
 }
 
+/* ================================================================
+ * gtid 侧回调模式适配
+ * ================================================================ */
+
+/* gtidOnKey 回调上下文：需要传递 dbid 和 argv 给回调 */
+typedef struct {
+    int dbid;
+    robj **argv;
+    gtidGapLogKeysInfos *kis;
+} gtidOnKeyCtx;
+
 static void addKeyInfo(gtidGapLogKeysInfos *kis, int dbid, int type, sds key,
                        sds *subkeys, int subkeys_count)
 {
@@ -40,186 +52,24 @@ static void addKeyInfo(gtidGapLogKeysInfos *kis, int dbid, int type, sds key,
     kis->keys[kis->size++] = ki;
 }
 
+/* gtid 回调：在回调中 sdsdup 创建 gtidGapLogKeyInfo */
+static void gtidOnKey(void *ctx, int key_type, int key_arg_idx,
+                      int subkeys_count, int subkeys_start,
+                      int subkeys_step, const int *subkey_arg_idxs)
+{
+    gtidOnKeyCtx *gctx = ctx;
+    sds key = sdsdup((sds)gctx->argv[key_arg_idx]->ptr);
+    sds *subkeys = subkeys_count > 0 ? zmalloc(sizeof(sds) * subkeys_count) : NULL;
+    for (int i = 0; i < subkeys_count; i++) {
+        int subkey_idx = subkey_arg_idxs ? subkey_arg_idxs[i] : (subkeys_start + i * subkeys_step);
+        subkeys[i] = sdsdup((sds)gctx->argv[subkey_idx]->ptr);
+    }
+    addKeyInfo(gctx->kis, gctx->dbid, key_type, key, subkeys, subkeys_count);
+}
+
 void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc) {
     if (argc < 2 || kis == NULL) return;
 
-    sds cmd = (sds)args[0]->ptr;
-
-    if (!strcasecmp(cmd, "del") ||
-        !strcasecmp(cmd, "unlink")) {
-        for (int i = 1; i < argc; i++) {
-            addKeyInfo(kis, dbid, OBJ_UNKNOWN, sdsdup((sds)args[i]->ptr), NULL, 0);
-        }
-        return;
-    }
-
-    if (!strcasecmp(cmd, "set") || !strcasecmp(cmd, "setnx") ||
-        !strcasecmp(cmd, "setex") || !strcasecmp(cmd, "psetex") ||
-        !strcasecmp(cmd, "incr") || !strcasecmp(cmd, "decr") ||
-        !strcasecmp(cmd, "incrby") || !strcasecmp(cmd, "decrby") ||
-        !strcasecmp(cmd, "incrbyfloat") || !strcasecmp(cmd, "decrbyfloat") ||
-        !strcasecmp(cmd, "append") || !strcasecmp(cmd, "getset") ||
-        !strcasecmp(cmd, "setrange") || !strcasecmp(cmd, "setbit") ||
-        !strcasecmp(cmd, "bitfield")) {
-        addKeyInfo(kis, dbid, OBJ_STRING, sdsdup((sds)args[1]->ptr), NULL, 0);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "mset") || !strcasecmp(cmd, "msetnx")) {
-        for (int i = 1; i < argc; i += 2) {
-            addKeyInfo(kis, dbid, OBJ_STRING, sdsdup((sds)args[i]->ptr), NULL, 0);
-        }
-        return;
-    }
-
-    if (!strcasecmp(cmd, "hset") || !strcasecmp(cmd, "hmset")) {
-        int subkeys_count = (argc - 2) / 2;
-        sds *subkeys = NULL;
-        if (subkeys_count > 0) {
-            subkeys = zmalloc(sizeof(sds) * subkeys_count);
-            for (int i = 0; i < subkeys_count; i++) {
-                subkeys[i] = sdsdup((sds)args[2 + i * 2]->ptr);
-            }
-        }
-        addKeyInfo(kis, dbid, OBJ_HASH, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "hdel")) {
-        int subkeys_count = argc - 2;
-        sds *subkeys = NULL;
-        if (subkeys_count > 0) {
-            subkeys = zmalloc(sizeof(sds) * subkeys_count);
-            for (int i = 0; i < subkeys_count; i++) {
-                subkeys[i] = sdsdup((sds)args[2 + i]->ptr);
-            }
-        }
-        addKeyInfo(kis, dbid, OBJ_HASH, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "hsetnx") ||
-        !strcasecmp(cmd, "hincrby") || !strcasecmp(cmd, "hincrbyfloat")) {
-        sds *subkeys = NULL;
-        int subkeys_count = 0;
-        if (argc >= 3) {
-            subkeys_count = 1;
-            subkeys = zmalloc(sizeof(sds));
-            subkeys[0] = sdsdup((sds)args[2]->ptr);
-        }
-        addKeyInfo(kis, dbid, OBJ_HASH, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "sadd") || !strcasecmp(cmd, "srem") || !strcasecmp(cmd, "spop")) {
-        int subkeys_count = argc - 2;
-        sds *subkeys = NULL;
-        if (subkeys_count > 0) {
-            subkeys = zmalloc(sizeof(sds) * subkeys_count);
-            for (int i = 0; i < subkeys_count; i++) {
-                subkeys[i] = sdsdup((sds)args[2 + i]->ptr);
-            }
-        }
-        addKeyInfo(kis, dbid, OBJ_SET, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "smove")) {
-        /* smove source destination member: both source and dest are modified */
-        if (argc >= 3) {
-            addKeyInfo(kis, dbid, OBJ_SET, sdsdup((sds)args[1]->ptr), NULL, 0);
-            addKeyInfo(kis, dbid, OBJ_SET, sdsdup((sds)args[2]->ptr), NULL, 0);
-        } else if (argc >= 2) {
-            addKeyInfo(kis, dbid, OBJ_SET, sdsdup((sds)args[1]->ptr), NULL, 0);
-        }
-        return;
-    }
-
-    if (!strcasecmp(cmd, "zadd")) {
-        int i = 2;
-        while (i < argc) {
-            sds arg = (sds)args[i]->ptr;
-            if (!strcasecmp(arg, "nx") || !strcasecmp(arg, "xx") ||
-                !strcasecmp(arg, "ch") || !strcasecmp(arg, "incr")) {
-                i++;
-            } else {
-                break;
-            }
-        }
-        int subkeys_count = (argc - i) / 2;
-        sds *subkeys = NULL;
-        if (subkeys_count > 0) {
-            subkeys = zmalloc(sizeof(sds) * subkeys_count);
-            for (int j = 0; j < subkeys_count; j++) {
-                subkeys[j] = sdsdup((sds)args[i + 1 + j * 2]->ptr);
-            }
-        }
-        addKeyInfo(kis, dbid, OBJ_ZSET, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "zrem")) {
-        int subkeys_count = argc - 2;
-        sds *subkeys = NULL;
-        if (subkeys_count > 0) {
-            subkeys = zmalloc(sizeof(sds) * subkeys_count);
-            for (int i = 0; i < subkeys_count; i++) {
-                subkeys[i] = sdsdup((sds)args[2 + i]->ptr);
-            }
-        }
-        addKeyInfo(kis, dbid, OBJ_ZSET, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "zincrby")) {
-        sds *subkeys = NULL;
-        int subkeys_count = 0;
-        if (argc >= 4) {
-            subkeys_count = 1;
-            subkeys = zmalloc(sizeof(sds));
-            subkeys[0] = sdsdup((sds)args[3]->ptr);
-        }
-        addKeyInfo(kis, dbid, OBJ_ZSET, sdsdup((sds)args[1]->ptr), subkeys, subkeys_count);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "zremrangebyrank") ||
-        !strcasecmp(cmd, "zremrangebyscore") ||
-        !strcasecmp(cmd, "zremrangebylex")) {
-        addKeyInfo(kis, dbid, OBJ_ZSET, sdsdup((sds)args[1]->ptr), NULL, 0);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "lpush") || !strcasecmp(cmd, "rpush") ||
-        !strcasecmp(cmd, "lpushx") || !strcasecmp(cmd, "rpushx") ||
-        !strcasecmp(cmd, "lpop") || !strcasecmp(cmd, "rpop") ||
-        !strcasecmp(cmd, "lrem") || !strcasecmp(cmd, "linsert") ||
-        !strcasecmp(cmd, "lset") || !strcasecmp(cmd, "ltrim")) {
-        addKeyInfo(kis, dbid, OBJ_LIST, sdsdup((sds)args[1]->ptr), NULL, 0);
-        return;
-    }
-
-    if (!strcasecmp(cmd, "rename") || !strcasecmp(cmd, "renamenx")) {
-        if (argc >= 3) {
-            addKeyInfo(kis, dbid, OBJ_UNKNOWN, sdsdup((sds)args[1]->ptr), NULL, 0);
-            addKeyInfo(kis, dbid, OBJ_UNKNOWN, sdsdup((sds)args[2]->ptr), NULL, 0);
-        } else if (argc >= 2) {
-            addKeyInfo(kis, dbid, OBJ_UNKNOWN, sdsdup((sds)args[1]->ptr), NULL, 0);
-        }
-        return;
-    }
-
-    if (!strcasecmp(cmd, "move") ||
-        !strcasecmp(cmd, "persist") ||
-        !strcasecmp(cmd, "expire") || !strcasecmp(cmd, "pexpire") ||
-        !strcasecmp(cmd, "expireat") || !strcasecmp(cmd, "pexpireat")) {
-        addKeyInfo(kis, dbid, OBJ_UNKNOWN, sdsdup((sds)args[1]->ptr), NULL, 0);
-        return;
-    }
-
-    /* unknown command, fallback: use first arg as key to avoid crash */
-    if (argc >= 2) {
-        serverLog(LL_WARNING, "Unknown command '%s' for key propagation", cmd);
-        addKeyInfo(kis, dbid, OBJ_UNKNOWN, sdsdup((sds)args[1]->ptr), NULL, 0);
-    }
+    gtidOnKeyCtx ctx = { .dbid = dbid, .argv = args, .kis = kis };
+    cmdParseKeys(dbid, args, argc, &ctx, gtidOnKey);
 }
