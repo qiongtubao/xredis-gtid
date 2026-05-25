@@ -46,7 +46,7 @@ void freeGtidGapLog(gtidGapLog* gaplog) {
 gtidGapLogKeysInfos* createGtidGapLogKeysInfos(int max_size) {
     gtidGapLogKeysInfos* infos = zmalloc(sizeof(gtidGapLogKeysInfos));
     infos->size = 0;
-    infos->keys = zmalloc(sizeof(gtidGapLogKeyInfo*) * max_size);
+    infos->keys = zcalloc(sizeof(gtidGapLogKeyInfo*) * max_size);
     return infos;
 }
 
@@ -62,7 +62,7 @@ void freeGtidGapLogKeysInfos(void *data) {
 
 /*gap log key info*/
 gtidGapLogKeyInfo* createGtidGapLogKeyInfo(int dbid, int type, sds key, sds* subkeys, int subkeys_count) {
-    gtidGapLogKeyInfo *ki = zmalloc(sizeof(gtidGapLogKeyInfo));
+    gtidGapLogKeyInfo *ki = zcalloc(sizeof(gtidGapLogKeyInfo));
     ki->dbid = dbid;
     ki->key_type = type;
     ki->key = key;           /* move */
