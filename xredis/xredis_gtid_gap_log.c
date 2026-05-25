@@ -46,7 +46,7 @@ void freeGtidGapLog(gtidGapLog* gaplog) {
 gtidGapLogKeysInfos* createGtidGapLogKeysInfos(int max_size) {
     gtidGapLogKeysInfos* infos = zmalloc(sizeof(gtidGapLogKeysInfos));
     infos->size = 0;
-    infos->keys = zcalloc(sizeof(gtidGapLogKeyInfo*) * max_size);
+    infos->keys = zmalloc(sizeof(gtidGapLogKeysInfos) * max_size);
     return infos;
 }
 
@@ -79,4 +79,51 @@ void freeGtidGapLogKeyInfo(gtidGapLogKeyInfo* ki) {
     }
     zfree(ki->subkeys);
     zfree(ki);
+}
+
+gtidGapLogKeyInfo** gtidGapLogKeysPrepareBuildfer(gtidGapLogKeysBuilder* builder, int add_numkeys) {
+    if (!builder->keys_infos) {
+        builder->keys_infos = builder->cache;
+    }
+
+    if (add_numkeys  + builder->numkeys > builder->size) {
+        if (builder->keys_infos != builder->cache) {
+            builder->keys_infos = zrealloc(builder->keys_infos, sizeof(gtidGapLogKeyInfo*) * ( 2 * builder->size));
+        } else {
+            builder->keys_infos = zmalloc(sizeof(gtidGapLogKeyInfo*) * (2 * builder->size));
+            if (builder->numkeys)
+                memcpy(builder->keys_infos, builder->cache, sizeof(gtidGapLogKeyInfo*) * builder->numkeys);
+        }
+        builder->size = 2 * builder->size;
+    }
+    return builder->keys_infos + builder->numkeys;
+
+}
+
+void freeGtidGaplogKeysBuilder(gtidGapLogKeysBuilder* builer) {
+    for (int i  = 0; i < builer->numkeys; i++) {
+        freeGtidGapLogKeyInfo(builer->keys_infos[i]);  
+        builer->keys_infos[i] = NULL;
+    }
+    if (builer && builer->keys_infos != builer->cache) {
+        zfree(builer->keys_infos);
+    }   
+}
+
+gtidGapLogKeysInfos* buildGtidGapLogKeys(gtidGapLogKeysBuilder* builder) {
+    gtidGapLogKeysInfos* keys = zmalloc(sizeof(gtidGapLogKeysInfos));
+    keys->size = builder->numkeys;
+    if (builder->cache == builder->keys_infos) {
+        keys->keys =zmalloc(sizeof(gtidGapLogKeyInfo*) * keys->size);
+        for(int i = 0; i < builder->numkeys; i++) {
+            keys->keys[i] = builder->keys_infos[i];
+            builder->keys_infos[i] = NULL;
+        }
+    } else {
+        keys->keys = builder->keys_infos;
+        builder->keys_infos = NULL;
+        
+    }
+    builder->numkeys = 0;
+    return keys;
 }

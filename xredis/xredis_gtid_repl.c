@@ -1316,7 +1316,7 @@ static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
     }
     zfree(list->cmds);
 }
-gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long select_dbid) {
+void parseMultiCommand(gtidGapLogKeysBuilder* build, long long multi_end_off, long long select_dbid) {
     long long next_off = multi_end_off;
 
     gtidParsedCmdList cmdlist = {0};
@@ -1351,7 +1351,8 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
             ) {
             break;
         } else {
-            max_keys += cmdParseCountKeys(saved_argv, saved_argc);
+            // max_keys += cmdParseCountKeys(NULL, saved_argv, saved_argc);
+
         }
         
         next_off += inner_cmd_len;
@@ -1374,7 +1375,7 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
     }
 
     /* last command is exec */
-    gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(max_keys);
+    // gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(max_keys);
     for (int i = 0; i < cmdlist.num_cmds - 1; i++) {
         gtidParsedCmd *cmd = &cmdlist.cmds[i];
         sds cmd_name = (sds)cmd->argv[0]->ptr;
@@ -1385,15 +1386,14 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
         }
 
         /* add keys */
-        addKeyInfoToKeysInfos(kis, dbid, cmd->argv, cmd->argc);
+        addKeyInfoToKeysInfos(build, dbid, cmd->argv, cmd->argc);
     }
 
     gtidParsedCmdListCleanup(&cmdlist);
     cleanMockClient(&inner_c);
-    return kis;
 }
 
-gtidGapLogKeysInfos * parseGtidCommand(client *mock) {
+int parseGtidCommand(gtidGapLogKeysBuilder* builder, client *mock) {
     long long dbid = 0;
 
     if (mock->argc < 4 || mock->argv == NULL || mock->argv[2] == NULL) {
@@ -1402,10 +1402,19 @@ gtidGapLogKeysInfos * parseGtidCommand(client *mock) {
     }
 
     getLongLongFromObject(mock->argv[2], &dbid);
-    int key_count = cmdParseCountKeys(mock->argv + 3, mock->argc - 3);
-    gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(key_count);
-    addKeyInfoToKeysInfos(kis, dbid, mock->argv + 3, mock->argc - 3);
-    return kis;
+    // int key_count = cmdParseCountKeys(NULL, mock->argv + 3, mock->argc - 3);
+    
+    // gtidGapLogKeysCtx ctx = GETKEYS_GTIDGAPLOG_RESULT_INIT;
+    addKeyInfoToKeysInfos(builder, dbid, mock->argv + 3, mock->argc - 3);
+    // if (ctx.keys_infos != NULL) {
+    //     return ctx.keys_infos;
+    // } else {
+    //     gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(ctx.numkeys);
+    //     for(int i = 0; i < ctx.numkeys; i++) {
+    //         kis->keys[i] = ctx.cache[i];
+    //     }
+    //     return kis;
+    // }
 }
 
 skipType gtid_skip_type = {
@@ -1502,7 +1511,8 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                 client mock = {0}; //mock client use in processMultibulkBuffer
                 long long cur_offset = offset;
                 long long dbid_from_select = -1;
-                gtidGapLogKeysInfos *kis = NULL;
+                
+                gtidGapLogKeysBuilder build = GTID_GAPLOG_KEYS_BUILER_INIT;
                 while (1) {
                     resetMockClient(&mock);
                     size_t cur_cmd_len = 0;
@@ -1522,26 +1532,30 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                     }
 
                     if (!strcasecmp(cmd_name, "multi")) {
-                        kis = parseMultiCommand(cur_offset + cur_cmd_len, dbid_from_select);
+                        parseMultiCommand(&build, cur_offset + cur_cmd_len, dbid_from_select);
                         break;
                     }
 
                     if (!strcasecmp(cmd_name, "gtid")) {
-                        kis = parseGtidCommand(&mock);
+                        parseGtidCommand(&build, &mock);
                         break;
                     }
                     serverLog(LL_WARNING, "[gaplog] unexpected command %s", cmd_name);
                     serverPanic("[gaplog] unexpected command");
                 }
                 cleanMockClient(&mock);
-                serverAssert(kis != NULL);
 
-                if (kis->size > 0 && saveGapLogEntry(uuid, gno, kis)) {
+                
+                if (build.numkeys > 0) {
+                    saveGapLogEntry(uuid, gno, buildGtidGapLogKeys(&build));
                     while (server.gtid_gap_log->size > (long long)server.gtid_xsync_max_gap) {
                         evictOldestGapLogEntry();
                     }
                 } else {
-                    freeGtidGapLogKeysInfos(kis);
+                    if (build.keys_infos != NULL) {
+                        zfree(build.keys_infos);
+                    }
+                    freeGtidGaplogKeysBuilder(&build);
                 }
             }  
             sdsfree(uuid);

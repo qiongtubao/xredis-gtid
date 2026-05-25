@@ -276,6 +276,19 @@ typedef struct gtidGapLogKeysInfos {
     size_t size;
 } gtidGapLogKeysInfos;
 
+#define MAX_KEYS_BUFFER 256
+typedef struct gtidGapLogKeysBuilder {
+  gtidGapLogKeyInfo* cache[MAX_KEYS_BUFFER];
+  gtidGapLogKeyInfo** keys_infos;
+  int numkeys;
+  int size;
+} gtidGapLogKeysBuilder;
+#define GTID_GAPLOG_KEYS_BUILER_INIT {{0}, NULL, 0, MAX_KEYS_BUFFER}
+gtidGapLogKeysInfos* buildGtidGapLogKeys(gtidGapLogKeysBuilder* builder);
+gtidGapLogKeyInfo** gtidGapLogKeysPrepareBuildfer(gtidGapLogKeysBuilder* builder, int add_numkeys);
+void freeGtidGaplogKeysBuilder(gtidGapLogKeysBuilder* builder);
+
+
 typedef struct gtidGapLog {
   dict* data;           //dict<uuid, skiplist<gtidGapLogKeyInfo>>
   list* history;   //list<uuidSet>
@@ -286,7 +299,7 @@ gtidGapLog* createGtidGapLog(void);
 void resetGtidGapLog(gtidGapLog* gtid_gap_log);
 void freeGtidGapLog(gtidGapLog* gaplog);
 
-gtidGapLogKeysInfos* createGtidGapLogKeysInfos(int max_size);
+gtidGapLogKeysInfos* createGtidGapLogKeysInfos();
 void freeGtidGapLogKeysInfos(void* gtid_gap_log_keys_infos);
 
 gtidGapLogKeyInfo* createGtidGapLogKeyInfo(int dbid, int type, sds key, sds* subkeys, int subkeys_count);
@@ -299,7 +312,7 @@ int processMultibulkBuffer(client* c);
 /*  adaptation for version diff */
 /* backlog data copy to buffer (version)*/
 ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size);
-void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc);
+void addKeyInfoToKeysInfos(gtidGapLogKeysBuilder* builder, int dbid, robj **args, int argc);
 
 
 /* gtid test */

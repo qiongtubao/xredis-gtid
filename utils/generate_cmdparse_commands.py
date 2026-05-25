@@ -26,10 +26,10 @@ def generate_command_def(output_path, commands):
     ]
 
     for cmd in commands:
-        lines.append(f'    {{"{cmd["name"]}", {cmd["count"]}, {cmd["parse"]} }},')
+        lines.append(f'    {{"{cmd["name"]}", {cmd["parse"]} }},')
 
     lines.extend([
-        "    {NULL, NULL, NULL}",
+        "    {NULL, NULL}",
         "};",
         "",
     ])

@@ -39,37 +39,35 @@ ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size) {
  * ================================================================ */
 
 /* gtidOnKey 回调上下文：需要传递 dbid 和 argv 给回调 */
-typedef struct {
-    int dbid;
-    robj **argv;
-    gtidGapLogKeysInfos *kis;
-} gtidOnKeyCtx;
 
-static void addKeyInfo(gtidGapLogKeysInfos *kis, int dbid, int type, sds key,
+static void addKeyInfo(gtidGapLogKeysBuilder *builder, int dbid, int type, sds key,
                        sds *subkeys, int subkeys_count)
 {
+    gtidGapLogKeysPrepareBuildfer(builder, 1);
     gtidGapLogKeyInfo *ki = createGtidGapLogKeyInfo(dbid, type, key, subkeys, subkeys_count);
-    kis->keys[kis->size++] = ki;
+    builder->keys_infos[builder->numkeys++] = ki;
 }
 
 /* gtid 回调：在回调中 sdsdup 创建 gtidGapLogKeyInfo */
-static void gtidOnKey(void *ctx, int key_type, int key_arg_idx,
+static void gtidOnKey(void *ctx, int dbid, struct redisComamnd* cmd, robj** argv, int argc,  int key_arg_idx,
                       int subkeys_count, int subkeys_start,
-                      int subkeys_step, const int *subkey_arg_idxs)
+                      int subkeys_step, const int *subkey_arg_idxs,
+                      const cmdParseKeyExtra *extra)
 {
-    gtidOnKeyCtx *gctx = ctx;
-    sds key = sdsdup((sds)gctx->argv[key_arg_idx]->ptr);
+    UNUSED(extra);
+    UNUSED(argc);
+    gtidGapLogKeysBuilder *builder = ctx;
+    sds key = sdsdup((sds)argv[key_arg_idx]->ptr);
     sds *subkeys = subkeys_count > 0 ? zmalloc(sizeof(sds) * subkeys_count) : NULL;
     for (int i = 0; i < subkeys_count; i++) {
         int subkey_idx = subkey_arg_idxs ? subkey_arg_idxs[i] : (subkeys_start + i * subkeys_step);
-        subkeys[i] = sdsdup((sds)gctx->argv[subkey_idx]->ptr);
+        subkeys[i] = sdsdup((sds)argv[subkey_idx]->ptr);
     }
-    addKeyInfo(gctx->kis, gctx->dbid, key_type, key, subkeys, subkeys_count);
+    addKeyInfo(builder, dbid, cmdParseKeyTypeFromCommand(cmd), key, subkeys, subkeys_count);
 }
 
-void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc) {
-    if (argc < 2 || kis == NULL) return;
-
-    gtidOnKeyCtx ctx = { .dbid = dbid, .argv = args, .kis = kis };
-    cmdParseKeys(dbid, args, argc, &ctx, gtidOnKey);
+void addKeyInfoToKeysInfos(gtidGapLogKeysBuilder *builder, int dbid, robj **args, int argc) {
+    if (argc < 2) return;
+    serverAssert( builder != NULL);
+    cmdParseKeys(dbid, NULL, args, argc, builder, gtidOnKey);
 }
