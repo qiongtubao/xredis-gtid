@@ -60,6 +60,10 @@ typedef struct uuidSet {
     struct uuidSet *next;
 } uuidSet;
 
+typedef struct uuidSetIterator {
+    gtidIntervalNode *next;
+} uuidSetIterator;
+
 typedef struct gtidSet {
     /* next gno for current if > 0 */
     gno_t curnext;
@@ -70,6 +74,10 @@ typedef struct gtidSet {
     struct uuidSet* header;
     struct uuidSet* tail;
 } gtidSet;
+
+typedef struct gtidSetIterator {
+    uuidSet *next;
+} gtidSetIterator;
 
 typedef struct gtidStat {
    size_t used_memory;
@@ -97,6 +105,9 @@ gno_t uuidSetCount(uuidSet* uuid_set);
 int uuidSetContains(uuidSet* uuid_set, gno_t gno);
 size_t uuidSetEstimatedEncodeBufferSize(uuidSet* uuid_set);
 void uuidSetGetStat(uuidSet *uuid_set, gtidStat *stat);
+int uuidSetInitIterator(uuidSetIterator* iterator, uuidSet* gtid_set);
+void uuidSetDeinitIterator(uuidSetIterator* iterator);
+gtidIntervalNode* uuidSetIteratorNext(uuidSetIterator* iterator);
 
 gtidSet* gtidSetNew();
 void gtidSetFree(gtidSet* gtid_set);
@@ -115,6 +126,10 @@ size_t gtidSetEstimatedEncodeBufferSize(gtidSet* gtid_set);
 void gtidSetGetStat(gtidSet *gtid_set, gtidStat *stat);
 uuidSet* gtidSetFind(gtidSet* gtid_set, const char* uuid, size_t uuid_len);
 int gtidSetRelated(gtidSet *set1, gtidSet *set2);
+int gtidSetInitIterator(gtidSetIterator* iterator, gtidSet* gtid_set);
+void gtidSetDeinitIterator(gtidSetIterator* iterator);
+uuidSet* gtidSetIteratorNext(gtidSetIterator* iterator);
+
 
 /* Cache current uuid set to skip uuid compare. Note that it would crash
  * if current uuid set not cached or removed. */
@@ -188,6 +203,7 @@ void gtidSeqAppend(gtidSeq *seq, const char *uuid, size_t uuid_len, gno_t gno, l
 void gtidSeqTrim(gtidSeq *seq, long long until);
 size_t gtidSeqEstimatedEncodeBufferSize(gtidSeq* seq);
 ssize_t gtidSeqEncode(char *buf, size_t maxlen, gtidSeq* seq);
+long long gtidSeqLookup(gtidSeq *seq, char* uuid, size_t uuid_len, gno_t gno);
 long long gtidSeqXsync(gtidSeq *seq, gtidSet *req, gtidSet **pcont);
 gtidSet *gtidSeqPsync(gtidSeq *seq, long long offset);
 void gtidSeqGetStat(gtidSeq *seq, gtidSeqStat *stat);
@@ -224,5 +240,7 @@ int tryInsertSkipList(skiplist *sl, long long score, void *value, int score_uniq
 
 int deleteSkipList(skiplist *sl, long long score);
 skiplistNode* firstSkipList(skiplist *sl);
+
+skiplistNode* findFirstGteSkipList(skiplist *sl, long long target);
 
 #endif  /* __REDIS_CTRIP_GTID_H */
