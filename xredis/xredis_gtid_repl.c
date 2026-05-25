@@ -1196,29 +1196,7 @@ static parsedSyncReply *parseSyncReply(sds reply) {
     return parsed;
 }
 
-/* 
-1. TODO 
-    can use gtidSeqXsync???
-2. TODO
-    from last to frist find offset?
- */
-static long long gtidSeqLookup(gtidSeq *seq, sds uuid, gno_t gno) {
-    if (seq == NULL) return -1;
-
-    gtidSegment *seg = seq->lastseg;
-    while (seg) {
-        if (seg->uuid_len == sdslen(uuid) &&
-            memcmp(seg->uuid, uuid, sdslen(uuid)) == 0 &&
-            gno >= seg->base_gno + (gno_t)seg->tgno &&
-            gno < seg->base_gno + (gno_t)seg->ngno) {
-            size_t idx = (size_t)(gno - seg->base_gno);
-            return seg->base_offset + seg->deltas[idx];
-        }
-        seg = seg->prev;
-    }
-    return -1;
-}
-#define ONCE_READ_BUF_SIZE 8192
+#define ONCE_READ_BUF_SIZE 256
 
 static int parseCmdFromBacklog(long long offset, client *mock, size_t *cmd_len) {
     size_t total_read = 0;
@@ -1316,7 +1294,7 @@ static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
     }
     zfree(list->cmds);
 }
-gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long select_dbid) {
+void parseMultiCommand(gtidGapLogKeysBuilder* build, long long multi_end_off, long long select_dbid) {
     long long next_off = multi_end_off;
 
     gtidParsedCmdList cmdlist = {0};
@@ -1335,24 +1313,19 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
         int inner_argc = inner_c.argc;
         robj *inner_argv3 = (inner_c.argc >= 4) ? inner_c.argv[3] : NULL;
 
-        /* 在 move argv 之前，保存 argv 指针用于 key count 计算 */
         robj **saved_argv = inner_c.argv;
         int saved_argc = inner_c.argc;
 
         /* move argv to cmdlist */
         gtidParsedCmdListAdd(&cmdlist, &inner_c);
 
-        if (!strcasecmp(cmd0, "select")) {
-
-        } else if (inner_argc >= 4 &&
+        if (inner_argc >= 4 &&
             !strcasecmp(cmd0, "gtid") &&
             inner_argv3 != NULL &&
             !strcasecmp((sds)inner_argv3->ptr, "exec")
             ) {
             break;
-        } else {
-            max_keys += cmdParseCountKeys(saved_argv, saved_argc);
-        }
+        } 
         
         next_off += inner_cmd_len;
     }
@@ -1374,7 +1347,6 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
     }
 
     /* last command is exec */
-    gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(max_keys);
     for (int i = 0; i < cmdlist.num_cmds - 1; i++) {
         gtidParsedCmd *cmd = &cmdlist.cmds[i];
         sds cmd_name = (sds)cmd->argv[0]->ptr;
@@ -1385,15 +1357,14 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
         }
 
         /* add keys */
-        addKeyInfoToKeysInfos(kis, dbid, cmd->argv, cmd->argc);
+        addKeyToKeysBuilder(build, dbid, cmd->argv, cmd->argc);
     }
 
     gtidParsedCmdListCleanup(&cmdlist);
     cleanMockClient(&inner_c);
-    return kis;
 }
 
-gtidGapLogKeysInfos * parseGtidCommand(client *mock) {
+int parseGtidCommand(gtidGapLogKeysBuilder* builder, client *mock) {
     long long dbid = 0;
 
     if (mock->argc < 4 || mock->argv == NULL || mock->argv[2] == NULL) {
@@ -1402,17 +1373,14 @@ gtidGapLogKeysInfos * parseGtidCommand(client *mock) {
     }
 
     getLongLongFromObject(mock->argv[2], &dbid);
-    int key_count = cmdParseCountKeys(mock->argv + 3, mock->argc - 3);
-    gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(key_count);
-    addKeyInfoToKeysInfos(kis, dbid, mock->argv + 3, mock->argc - 3);
-    return kis;
+    addKeyToKeysBuilder(builder, dbid, mock->argv + 3, mock->argc - 3);
 }
 
 skipType gtid_skip_type = {
-    .freeValue = freeGtidGapLogKeysInfos
+    .freeValue = freeGtidGapLogKeys
 };
 
-static int saveGapLogEntry(sds uuid, gno_t gno, gtidGapLogKeysInfos *kis) {
+static int saveGapLogEntry(sds uuid, gno_t gno, gtidGapLogKeys *kis) {
     if (kis->size == 0) return 0;
 
 
@@ -1453,63 +1421,29 @@ static int saveGapLogEntry(sds uuid, gno_t gno, gtidGapLogKeysInfos *kis) {
     return 1;
 }
 
-static int evictOldestGapLogEntry(void) {
-    listNode *first_ln = listFirst(server.gtid_gap_log->history);
-    if (first_ln == NULL) return 0;
-
-    uuidSet *first_uuid_set = (uuidSet*)listNodeValue(first_ln);
-
-    gno_t min_gno = uuidSetNext(first_uuid_set, 0);
-    if (min_gno == 0) {
-        listDelNode(server.gtid_gap_log->history, first_ln);
-        return 0;
-    }
-
-    sds evict_uuid_sds = sdsnewlen(first_uuid_set->uuid, first_uuid_set->uuid_len);
-    dictEntry *de = dictFind(server.gtid_gap_log->data, evict_uuid_sds);
-    if (de != NULL) {
-        skiplist *sl = dictGetVal(de);
-        deleteSkipList(sl, min_gno);
-        if (sl->length == 0) {
-            dictDelete(server.gtid_gap_log->data, evict_uuid_sds);
-        }
-    } else {
-        serverPanic("not find keysinfo in gtid_gap_log");
-    }
-    sdsfree(evict_uuid_sds);
-    
-    uuidSetRemove(first_uuid_set, min_gno, min_gno);
-    if (uuidSetCount(first_uuid_set) == 0) {
-        listDelNode(server.gtid_gap_log->history, first_ln);
-    }
-
-    server.gtid_gap_log->size--;
-    return 1;
-}
-
 void saveGapLogFromGtidSet(gtidSet *mlost) {
-    if (mlost == NULL || server.gtid_seq == NULL) return;
-    if (server.gtid_gap_log == NULL || server.gtid_gap_log->data == NULL || server.gtid_gap_log->history == NULL) return;
-
-    uuidSet *us = mlost->header;
-    while (us) {
-        gtidIntervalNode *node = us->intervals->header->forwards[0];
-        while (node) {
+    gtidSetIterator gs_iterator;
+    gtidSetInitIterator(&gs_iterator, mlost);
+    uuidSet *us = NULL;
+    while ((us = gtidSetIteratorNext(&gs_iterator)) != NULL) {
+        uuidSetIterator us_iterator;
+        uuidSetInitIterator(&us_iterator,us);
+        
+        gtidIntervalNode *node = NULL;
+        while ((node = uuidSetIteratorNext(&us_iterator)) != NULL) {
             sds uuid = sdsnewlen(us->uuid, us->uuid_len);
             for (gno_t gno = node->start; gno <= node->end; gno++) {
-                long long offset = gtidSeqLookup(server.gtid_seq, uuid, gno);
+                long long offset = gtidSeqLookup(server.gtid_seq, uuid, sdslen(uuid), gno);
                 if (offset < 0) continue;
                 client mock = {0}; //mock client use in processMultibulkBuffer
                 long long cur_offset = offset;
                 long long dbid_from_select = -1;
-                gtidGapLogKeysInfos *kis = NULL;
+                
+                gtidGapLogKeysBuilder build = GTID_GAPLOG_KEYS_BUILER_INIT;
                 while (1) {
                     resetMockClient(&mock);
                     size_t cur_cmd_len = 0;
                     if (parseCmdFromBacklog(cur_offset, &mock, &cur_cmd_len) < 0) {
-                        break;
-                    }
-                    if (mock.argc < 1 || mock.argv == NULL || mock.argv[0] == NULL) {
                         break;
                     }
 
@@ -1522,34 +1456,37 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                     }
 
                     if (!strcasecmp(cmd_name, "multi")) {
-                        kis = parseMultiCommand(cur_offset + cur_cmd_len, dbid_from_select);
+                        parseMultiCommand(&build, cur_offset + cur_cmd_len, dbid_from_select);
                         break;
                     }
 
                     if (!strcasecmp(cmd_name, "gtid")) {
-                        kis = parseGtidCommand(&mock);
+                        parseGtidCommand(&build, &mock);
                         break;
                     }
                     serverLog(LL_WARNING, "[gaplog] unexpected command %s", cmd_name);
                     serverPanic("[gaplog] unexpected command");
                 }
                 cleanMockClient(&mock);
-                serverAssert(kis != NULL);
 
-                if (kis->size > 0 && saveGapLogEntry(uuid, gno, kis)) {
+                
+                if (build.numkeys > 0) {
+                    saveGapLogEntry(uuid, gno, buildGtidGapLogKeys(&build));
                     while (server.gtid_gap_log->size > (long long)server.gtid_xsync_max_gap) {
-                        evictOldestGapLogEntry();
+                        gapLogTrim(server.gtid_gap_log->size - server.gtid_xsync_max_gap);
                     }
                 } else {
-                    freeGtidGapLogKeysInfos(kis);
+                    if (build.keys_infos != NULL) {
+                        zfree(build.keys_infos);
+                    }
+                    freeGtidGaplogKeysBuilder(&build);
                 }
             }  
             sdsfree(uuid);
-            node = node->forwards[0];  
         }
-        us = us->next;
+        uuidSetDeinitIterator(&us_iterator);
     }
-
+    gtidSetDeinitIterator(&gs_iterator);
 }
 
 int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
@@ -1701,8 +1638,8 @@ int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
 
             sdsfree(gtid_cont_repr), sdsfree(gtid_slave_repr),
                 sdsfree(gtid_slost_repr);
-            gtidSetFree(gtid_slost), gtidSetFree(gtid_slave);
-
+            gtidSetFree(gtid_slost), gtidSetFree(gtid_slave),
+            gtidSetFree(gtid_mlost);
             result = PSYNC_CONTINUE;
         }
     }

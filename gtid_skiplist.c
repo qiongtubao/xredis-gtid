@@ -122,3 +122,12 @@ int deleteSkipList(skiplist *sl, long long score) {
 skiplistNode* firstSkipList(skiplist *sl) {
     return sl->header->level[0].forward;
 }
+
+skiplistNode* findFirstGteSkipList(skiplist *sl, long long target) {
+    skiplistNode *x = sl->header;
+    for (int i = sl->level - 1; i >= 0; i--) {
+        while (x->level[i].forward && x->level[i].forward->score < target)
+            x = x->level[i].forward;
+    }
+    return x->level[0].forward;
+}
