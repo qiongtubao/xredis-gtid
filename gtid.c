@@ -563,6 +563,21 @@ gno_t uuidSetNext(uuidSet* uuid_set, int update) {
     return gtidIntervalSkipListNext(uuid_set->intervals, update);
 }
 
+
+int uuidSetInitIterator(uuidSetIterator* iterator, uuidSet* uuid_set) {
+    iterator->next = uuid_set->intervals->header->forwards[0];
+    return 1;
+}
+void uuidSetDeinitIterator(uuidSetIterator* iterator) {
+
+}
+gtidIntervalNode* uuidSetIteratorNext(uuidSetIterator* iterator) {
+    if (iterator->next == NULL) return NULL;
+    gtidIntervalNode* node = iterator->next;
+    iterator->next = node->forwards[0];
+    return node;
+}
+
 gtidSet* gtidSetNew() {
     gtidSet *gtid_set = gtid_malloc(sizeof(*gtid_set));
     gtid_set->header = NULL;
@@ -839,6 +854,22 @@ int gtidSetRelated(gtidSet *set1, gtidSet *set2) {
     return 0;
 }
 
+
+/*gtidSet iterator*/
+int gtidSetInitIterator(gtidSetIterator* iterator, gtidSet* gtid_set) {
+    iterator->next = gtid_set->header;;
+    return 1;
+}
+void gtidSetDeinitIterator(gtidSetIterator* iterator) {
+
+}
+uuidSet* gtidSetIteratorNext(gtidSetIterator* iterator) {
+    if (iterator->next == NULL) return NULL;
+    uuidSet* cur = iterator->next;
+    iterator->next = cur->next;
+    return cur;
+}
+
 void uuidSetGetStat(uuidSet *uuid_set, gtidStat *stat) {
     stat->uuid_count = 1;
     stat->used_memory = uuid_set->intervals->node_count * GTID_INTERVAL_MEMORY;
@@ -1113,6 +1144,22 @@ ssize_t gtidSeqEncode(char *buf, size_t maxlen, gtidSeq* seq) {
         len +=gtidSegmentEncode(buf+len,maxlen-len,seq->lastseg);
     }
     return len;
+}
+
+
+long long gtidSeqLookup(gtidSeq *seq, char* uuid, size_t uuid_len, gno_t gno) {
+    gtidSegment *seg = seq->lastseg;
+    while (seg) {
+        if (seg->uuid_len == uuid_len &&
+            memcmp(seg->uuid, uuid, uuid_len) == 0 &&
+            gno >= seg->base_gno + (gno_t)seg->tgno &&
+            gno < seg->base_gno + (gno_t)seg->ngno) {
+            size_t idx = (size_t)(gno - seg->base_gno);
+            return seg->base_offset + seg->deltas[idx];
+        }
+        seg = seg->prev;
+    }
+    return -1;
 }
 
 /* Locate xsync continue position, return continue offset and gitset from

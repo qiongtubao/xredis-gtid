@@ -266,34 +266,75 @@ ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t va
 /* ================================================================
  * gapLog functions and structs
  * ================================================================ */
-typedef struct gtidGapLogKeyInfo {
+typedef struct gtidGapLogKey {
   unsigned long long dbid:4;      /* max 16 db */
   unsigned long long key_type:4;  /* OBJ_STRING/OBJ_LIST/OBJ_SET/OBJ_ZSET/OBJ_HASH */
   unsigned long long subkeys_count:56;
   sds key;                        /* key (sdsdup ) */
   sds* subkeys;                   /* subkeys (sdsdup ) */
-} gtidGapLogKeyInfo;
+} gtidGapLogKey;
 
-typedef struct gtidGapLogKeysInfos {
-    gtidGapLogKeyInfo** keys;
+typedef struct gtidGapLogKeys {
+    gtidGapLogKey** keys;
     size_t size;
-} gtidGapLogKeysInfos;
+} gtidGapLogKeys;
+
+#define MAX_KEYS_BUFFER 256
+#define GAPLOG_HISTORY_MAX_COUNT 100
+typedef struct gtidGapLogKeysBuilder {
+  gtidGapLogKey* cache[MAX_KEYS_BUFFER];
+  gtidGapLogKey** keys_infos;
+  int numkeys;
+  int size;
+} gtidGapLogKeysBuilder;
+#define GTID_GAPLOG_KEYS_BUILER_INIT {{0}, NULL, 0, MAX_KEYS_BUFFER}
+gtidGapLogKeys* buildGtidGapLogKeys(gtidGapLogKeysBuilder* builder);
+gtidGapLogKey** gtidGapLogKeysPrepareBuilder(gtidGapLogKeysBuilder* builder, int add_numkeys);
+void gtidGapLogDeinitKeysBuilder(gtidGapLogKeysBuilder* builder);
+void gtidGapLogKeysBuilderAddFromCmd(gtidGapLogKeysBuilder* builder, int dbid, robj **args, int argc);
+
+int cmdGetKeyType(struct redisCommand *cmd);
+
+
 
 typedef struct gtidGapLog {
-  dict* data;           //dict<uuid, skiplist<gtidGapLogKeyInfo>>
+  dict* data;           //dict<uuid, skiplist<gtidGapLogKey>>
   list* history;   //list<uuidSet>
   size_t size;  
 } gtidGapLog;
 
-gtidGapLog* createGtidGapLog(void);
-void resetGtidGapLog(gtidGapLog* gtid_gap_log);
-void freeGtidGapLog(gtidGapLog* gaplog);
+gtidGapLog* gtidGapLogNew(void);
+void gtidGapLogReset(gtidGapLog* gtid_gap_log);
+void gtidGapLogRelease(gtidGapLog* gaplog);
+int gtidGapLogTrim(gtidGapLog* log ,size_t size);
 
-gtidGapLogKeysInfos* createGtidGapLogKeysInfos(int max_size);
-void freeGtidGapLogKeysInfos(void* gtid_gap_log_keys_infos);
+typedef struct gtidGapLogDataIterator {
+  skiplistNode* node;
+} gtidGapLogDataIterator;
+void gtidGapLogInitDataIterator(gtidGapLogDataIterator *iter, skiplist *sl, gno_t start_gno);
+void gtidGapLogDeinitDataIterator(gtidGapLogDataIterator *iter);
+gno_t gtidGapLogDataGetGno(gtidGapLogDataIterator* iter);
+gtidGapLogKeys* gtidGapLogDataNext(gtidGapLogDataIterator* iterator);
 
-gtidGapLogKeyInfo* createGtidGapLogKeyInfo(int dbid, int type, sds key, sds* subkeys, int subkeys_count);
-void freeGtidGapLogKeyInfo(gtidGapLogKeyInfo* gtid_gap_log_key_info);
+
+typedef struct gtidGapLogHistoryIterator {
+    listNode* list_node;            
+    gtidIntervalNode* interval_node;
+    gno_t next_gno;                 
+} gtidGapLogHistoryIterator;
+
+void gtidGapLogInitHistoryIterator(gtidGapLogHistoryIterator* iter,
+                                    gtidGapLog* gaplog, long long index);
+gno_t gtidGapLogHistoryNext(gtidGapLogHistoryIterator* iter,
+                             const char** uuid, size_t* uuid_len);
+void gtidGapLogDeinitHistoryIterator(gtidGapLogHistoryIterator* iter);
+
+void addReplyGtidGapLogKeys(client* c, gtidGapLogKeys* keys);
+
+void gtidGapLogKeysRelease(void* keys);
+
+gtidGapLogKey* gtidGapLogKeyNew(int dbid, int type, sds key, sds* subkeys, int subkeys_count);
+void gtidGapLogKeyRelease(gtidGapLogKey* key);
 
 
 int processMultibulkBuffer(client* c);
@@ -302,8 +343,6 @@ int processMultibulkBuffer(client* c);
 /*  adaptation for version diff */
 /* backlog data copy to buffer (version)*/
 ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size);
-void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc);
-
 
 /* gtid test */
 int gtidTest(int argc, char **argv, int accurate);
