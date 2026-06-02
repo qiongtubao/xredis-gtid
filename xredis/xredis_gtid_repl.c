@@ -30,6 +30,14 @@
 #include <gtid.h>
 #include <ctype.h>
 
+/* readBacklogCtx 结构体定义（含完整 client，需在 server.h 之后才能编译）。
+ * 注意：此结构体同样定义在 xredis_gtid_gap_log.c 中，两处定义必须完全一致。 */
+struct readBacklogCtx {
+    client c;                       /* 可复用querybuf的mock client */
+    size_t base_backlog_offset;     /* 当前gno在backlog中的起始绝对偏移 */
+    size_t readed_backlog_offset;   /* 已从backlog读取到querybuf的字节数（相对偏移） */
+};
+
 int replicationSetupSlaveForXFullResync(client *slave, long long offset) {
     int ret = C_OK;
     sds gtid_lost_repr = NULL, repr = NULL;
@@ -1196,39 +1204,46 @@ static parsedSyncReply *parseSyncReply(sds reply) {
     return parsed;
 }
 
+
 #define ONCE_READ_BUF_SIZE 256
 
-static int parseCmdFromBacklog(long long offset, client *mock, size_t *cmd_len) {
+
+/* 从backlog解析一条完整RESP命令，ctx->readed_backlog_offset 自动推进（相对偏移） */
+int parseCmdFromBacklog(readBacklogCtx *ctx, size_t *cmd_len) {
     size_t total_read = 0;
-    size_t old_size = (sdslen(mock->querybuf) - mock->qb_pos);
+    size_t old_size = (sdslen(ctx->c.querybuf) - ctx->c.qb_pos);
     while (1) {
-        ssize_t nread = backlogAppendToSds(offset + total_read, &mock->querybuf, ONCE_READ_BUF_SIZE);
-        if (nread <= 0) {
-            serverLog(LL_WARNING, "[gaplog] backlogAppendToSds failed at offset %lld, nread=%zd",
-                      offset + total_read, nread);
-            return -1;
-        }
-        total_read += nread;
-
-        while (mock->qb_pos < sdslen(mock->querybuf)) {
-
-            if (processMultibulkBuffer(mock) != C_OK) {
-                if (mock->flags & CLIENT_PROTOCOL_ERROR) {
+         while (ctx->c.qb_pos < sdslen(ctx->c.querybuf)) {
+            if (processMultibulkBuffer(&ctx->c) != C_OK) {
+                if (ctx->c.flags & CLIENT_PROTOCOL_ERROR) {
                     serverLog(LL_WARNING, "[gaplog] protocol error at offset %lld, qb_pos=%zu, flags=%lu",
-                              offset, mock->qb_pos, (unsigned long)mock->flags);
+                              (long long)(ctx->base_backlog_offset + ctx->readed_backlog_offset),
+                              ctx->c.qb_pos, (unsigned long)ctx->c.flags);
                     return -1;
                 }
                 break;
             }
-
-            size_t consumed = old_size + total_read - (sdslen(mock->querybuf) - mock->qb_pos);
+            size_t consumed = old_size + total_read - (sdslen(ctx->c.querybuf) - ctx->c.qb_pos);
+            ctx->readed_backlog_offset += total_read;   /* 仅推进已读取，querybuf中剩余数据供下次解析复用 */
             if (cmd_len) *cmd_len = consumed;
             return 0;
         }
+        ssize_t nread = backlogAppendToSds(
+            (long long)(ctx->base_backlog_offset + ctx->readed_backlog_offset + total_read),
+            &ctx->c.querybuf, ONCE_READ_BUF_SIZE);
+        if (nread <= 0) {
+            /* 读取失败，返回错误 */
+            serverLog(LL_WARNING, "[gaplog] backlogAppendToSds failed at offset %lld, nread=%zd",
+                    (long long)(ctx->base_backlog_offset + ctx->readed_backlog_offset + total_read), nread);
+            return -1;
+        }
+        total_read += nread;
+        
+       
     }
     return -1;
 }
-static void cleanMockClient(client* mock) {
+void cleanMockClient(client* mock) {
     if (mock->argv) {
         for (int i = 0; i < mock->argc; i++)
             if (mock->argv[i]) decrRefCount(mock->argv[i]);
@@ -1239,7 +1254,19 @@ static void cleanMockClient(client* mock) {
     if(mock->querybuf) sdsfree(mock->querybuf); 
 }
 
-static void resetMockClient(client* mock) {
+/* 仅释放argv（decrRefCount + zfree），保留querybuf不动。
+ * 用于select后continue需释放当前命令但保留querybuf复用的场景。 */
+void freeMockClientArgv(client* mock) {
+    if (mock->argv) {
+        for (int i = 0; i < mock->argc; i++)
+            if (mock->argv[i]) decrRefCount(mock->argv[i]);
+        zfree(mock->argv);
+        mock->argv = NULL;
+        mock->argc = 0;
+    }
+}
+
+void resetMockClient(client* mock) {
     if (mock->argv) {
         for (int i = 0; i < mock->argc; i++)
             if (mock->argv[i]) decrRefCount(mock->argv[i]);
@@ -1294,30 +1321,27 @@ static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
     }
     zfree(list->cmds);
 }
-void parseMultiCommand(gtidGapLogKeysBuilder* build, long long multi_end_off, long long select_dbid) {
-    long long next_off = multi_end_off;
-
+/* ctx: 含可复用querybuf的client + 偏移追踪，ctx->readed_backlog_offset 已指向multi之后 */
+void parseMultiCommand(gtidGapLogKeysBuilder* build, long long select_dbid, readBacklogCtx *ctx) {
     gtidParsedCmdList cmdlist = {0};
-    client inner_c = {0};
-    int max_keys = 0;
     while (1) {
-        resetMockClient(&inner_c);
+        /* 释放argv但保留querybuf和qb_pos，数据已在querybuf中无需重新读取backlog */
+        freeMockClientArgv(&ctx->c);
+        // ctx->c.multibulklen = 0;
+        // ctx->c.bulklen = -1;
+        // ctx->c.flags = 0;
         size_t inner_cmd_len = 0;
-        if (parseCmdFromBacklog(next_off, &inner_c, &inner_cmd_len) < 0)
+        if (parseCmdFromBacklog(ctx, &inner_cmd_len) < 0)
             break;
 
-        serverAssert(inner_c.argv != NULL && inner_c.argc > 0);
+        serverAssert(ctx->c.argv != NULL && ctx->c.argc > 0);
 
-        
-        sds cmd0 = (sds)inner_c.argv[0]->ptr;
-        int inner_argc = inner_c.argc;
-        robj *inner_argv3 = (inner_c.argc >= 4) ? inner_c.argv[3] : NULL;
-
-        robj **saved_argv = inner_c.argv;
-        int saved_argc = inner_c.argc;
+        sds cmd0 = (sds)ctx->c.argv[0]->ptr;
+        int inner_argc = ctx->c.argc;
+        robj *inner_argv3 = (ctx->c.argc >= 4) ? ctx->c.argv[3] : NULL;
 
         /* move argv to cmdlist */
-        gtidParsedCmdListAdd(&cmdlist, &inner_c);
+        gtidParsedCmdListAdd(&cmdlist, &ctx->c);
 
         if (inner_argc >= 4 &&
             !strcasecmp(cmd0, "gtid") &&
@@ -1325,9 +1349,8 @@ void parseMultiCommand(gtidGapLogKeysBuilder* build, long long multi_end_off, lo
             !strcasecmp((sds)inner_argv3->ptr, "exec")
             ) {
             break;
-        } 
-        
-        next_off += inner_cmd_len;
+        }
+        /* ctx->readed_backlog_offset 已由 parseCmdFromBacklog 自动推进，无需手动 next_off */
     }
 
     serverAssert(cmdlist.num_cmds != 0);
@@ -1361,7 +1384,11 @@ void parseMultiCommand(gtidGapLogKeysBuilder* build, long long multi_end_off, lo
     }
 
     gtidParsedCmdListCleanup(&cmdlist);
-    cleanMockClient(&inner_c);
+    /* 释放argv但保留querybuf和qb_pos，供上层继续复用 */
+    freeMockClientArgv(&ctx->c);
+    ctx->c.multibulklen = 0;
+    ctx->c.bulklen = -1;
+    ctx->c.flags = 0;
 }
 
 int parseGtidCommand(gtidGapLogKeysBuilder* builder, client *mock) {
@@ -1369,125 +1396,19 @@ int parseGtidCommand(gtidGapLogKeysBuilder* builder, client *mock) {
 
     if (mock->argc < 4 || mock->argv == NULL || mock->argv[2] == NULL) {
         serverLog(LL_WARNING, "[gaplog] invalid GTID command, argc=%d", mock->argc);
-        return NULL;
+        return -1;
     }
 
     getLongLongFromObject(mock->argv[2], &dbid);
     addKeyToKeysBuilder(builder, dbid, mock->argv + 3, mock->argc - 3);
+    return 0;
 }
 
-skipType gtid_skip_type = {
-    .freeValue = freeGtidGapLogKeys
-};
-
-static int saveGapLogEntry(sds uuid, gno_t gno, gtidGapLogKeys *kis) {
-    if (kis->size == 0) return 0;
 
 
-    dictEntry *de = dictFind(server.gtid_gap_log->data, uuid);
-    skiplist *sl;
-    if (de == NULL) {
-        sl = createSkipList(&gtid_skip_type);
-        sds uuid_key = sdsdup(uuid);
-        dictAdd(server.gtid_gap_log->data, uuid_key, sl);
-    } else {
-        sl = dictGetVal(de);
-    }
-
-    if (tryInsertSkipList(sl, gno, kis, 1) == 0) {
-        return 0;
-    }
-
-    uuidSet *last_uuid_set = NULL;
-    listNode *tail_ln = listLast(server.gtid_gap_log->history);
-    if (tail_ln != NULL) {
-        last_uuid_set = (uuidSet*)listNodeValue(tail_ln);
-        if (last_uuid_set->uuid_len != sdslen(uuid) ||
-            memcmp(last_uuid_set->uuid, uuid, sdslen(uuid)) != 0) {
-            last_uuid_set = NULL;
-        }
-    }
-
-    if (last_uuid_set != NULL) {
-        uuidSetAdd(last_uuid_set, gno, gno);
-    } else {
-        uuidSet *new_uuid_set = uuidSetNew(uuid, sdslen(uuid));
-        uuidSetAdd(new_uuid_set, gno, gno);
-        listAddNodeTail(server.gtid_gap_log->history, new_uuid_set);
-    }
 
 
-    server.gtid_gap_log->size++;
-    return 1;
-}
 
-void saveGapLogFromGtidSet(gtidSet *mlost) {
-    gtidSetIterator gs_iterator;
-    gtidSetInitIterator(&gs_iterator, mlost);
-    uuidSet *us = NULL;
-    while ((us = gtidSetIteratorNext(&gs_iterator)) != NULL) {
-        uuidSetIterator us_iterator;
-        uuidSetInitIterator(&us_iterator,us);
-        
-        gtidIntervalNode *node = NULL;
-        while ((node = uuidSetIteratorNext(&us_iterator)) != NULL) {
-            sds uuid = sdsnewlen(us->uuid, us->uuid_len);
-            for (gno_t gno = node->start; gno <= node->end; gno++) {
-                long long offset = gtidSeqLookup(server.gtid_seq, uuid, sdslen(uuid), gno);
-                if (offset < 0) continue;
-                client mock = {0}; //mock client use in processMultibulkBuffer
-                long long cur_offset = offset;
-                long long dbid_from_select = -1;
-                
-                gtidGapLogKeysBuilder build = GTID_GAPLOG_KEYS_BUILER_INIT;
-                while (1) {
-                    resetMockClient(&mock);
-                    size_t cur_cmd_len = 0;
-                    if (parseCmdFromBacklog(cur_offset, &mock, &cur_cmd_len) < 0) {
-                        break;
-                    }
-
-                    sds cmd_name = (sds)mock.argv[0]->ptr;
-
-                    if (!strcasecmp(cmd_name, "select") && mock.argc >= 2) {
-                        getLongLongFromObject(mock.argv[1], &dbid_from_select);
-                        cur_offset = cur_offset + cur_cmd_len;
-                        continue;
-                    }
-
-                    if (!strcasecmp(cmd_name, "multi")) {
-                        parseMultiCommand(&build, cur_offset + cur_cmd_len, dbid_from_select);
-                        break;
-                    }
-
-                    if (!strcasecmp(cmd_name, "gtid")) {
-                        parseGtidCommand(&build, &mock);
-                        break;
-                    }
-                    serverLog(LL_WARNING, "[gaplog] unexpected command %s", cmd_name);
-                    serverPanic("[gaplog] unexpected command");
-                }
-                cleanMockClient(&mock);
-
-                
-                if (build.numkeys > 0) {
-                    saveGapLogEntry(uuid, gno, buildGtidGapLogKeys(&build));
-                    while (server.gtid_gap_log->size > (long long)server.gtid_xsync_max_gap) {
-                        gapLogTrim(server.gtid_gap_log->size - server.gtid_xsync_max_gap);
-                    }
-                } else {
-                    if (build.keys_infos != NULL) {
-                        zfree(build.keys_infos);
-                    }
-                    freeGtidGaplogKeysBuilder(&build);
-                }
-            }  
-            sdsfree(uuid);
-        }
-        uuidSetDeinitIterator(&us_iterator);
-    }
-    gtidSetDeinitIterator(&gs_iterator);
-}
 
 int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
     int result = PSYNC_BY_REDIS;

@@ -291,7 +291,6 @@ void freeGtidGaplogKeysBuilder(gtidGapLogKeysBuilder* builder);
 int cmdParseKeyTypeFromCommand(struct redisCommand *cmd);
 void addKeyToKeysBuilder(gtidGapLogKeysBuilder* builder, int dbid, robj **args, int argc);
 
-
 typedef struct gtidGapLog {
   dict* data;           //dict<uuid, skiplist<gtidGapLogKey>>
   list* history;   //list<uuidSet>
@@ -301,6 +300,7 @@ typedef struct gtidGapLog {
 gtidGapLog* createGtidGapLog(void);
 void resetGtidGapLog(gtidGapLog* gtid_gap_log);
 void freeGtidGapLog(gtidGapLog* gaplog);
+void saveGapLogFromGtidSet(gtidSet *mlost);
 typedef struct gtidGapLogDataIterator {
   skiplistNode* node;
 } gtidGapLogDataIterator;
@@ -337,6 +337,28 @@ int processMultibulkBuffer(client* c);
 /*  adaptation for version diff */
 /* backlog data copy to buffer (version)*/
 ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size);
+
+/* readBacklogCtx：解析backlog的上下文，包含可复用querybuf的client和偏移追踪。
+ * 完整结构体定义在 xredis_gtid_gap_log.c 和 xredis_gtid_repl.c 中（因依赖 client 完整类型）。 */
+typedef struct readBacklogCtx readBacklogCtx;
+
+/* 从backlog解析一条完整命令，ctx->readed_backlog_offset 自动更新 */
+int parseCmdFromBacklog(readBacklogCtx *ctx, size_t *cmd_len);
+/* 解析multi/exec事务块，ctx追踪偏移 */
+void parseMultiCommand(gtidGapLogKeysBuilder* build, long long select_dbid, readBacklogCtx *ctx);
+int parseGtidCommand(gtidGapLogKeysBuilder* builder, client *mock);
+/* ===== mock client 管理 ===== */
+void cleanMockClient(client* mock);
+void resetMockClient(client* mock);
+void freeMockClientArgv(client* mock);
+/* ===== gaplog 辅助 ===== */
+int saveGapLogEntry(sds uuid, gno_t gno, gtidGapLogKeys *kis);
+
+/* 获取 backlog 中指定 offset 处的数据指针和连续可用长度（零拷贝）。
+ * 返回指向 backlog 环缓冲区的指针，*len 设置为从 offset 开始连续可读的字节数。
+ * 如果数据跨越环缓冲区边界，*len 为到边界为止的长度，调用者需处理回绕。
+ * 返回 NULL 表示 offset 无效。 */
+char *backlogGetPtr(long long offset, size_t *len);
 
 /* gtid test */
 int gtidTest(int argc, char **argv, int accurate);
