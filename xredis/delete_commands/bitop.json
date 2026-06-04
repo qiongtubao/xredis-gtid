@@ -1,0 +1,4 @@
+{
+  "name": "bitop",
+  "parse": "cmdParseBitOp"
+}

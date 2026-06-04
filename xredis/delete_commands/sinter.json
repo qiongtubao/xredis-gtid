@@ -1,0 +1,5 @@
+{
+  "name": "sinter",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}

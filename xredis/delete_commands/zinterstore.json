@@ -1,0 +1,5 @@
+{
+  "name": "zinterstore",
+  "count": "cmdCountZunionstore",
+  "parse": "cmdParseZunionstore"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "spop",
+  "count": "cmdCountSingleKey",
+  "parse": "cmdParseSpop"
+}

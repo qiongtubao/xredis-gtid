@@ -251,16 +251,7 @@ static inline int isWrongTypeErrorReply(const char *s, size_t len) {
         return 0;
 }
 
-void ctrip_afterErrorReply(client *c, const char *s, size_t len) {
-    afterErrorReply(c,s,len);
-    if (server.repl_mode->mode != REPL_MODE_XSYNC) return;
-    /* Replica sending wrong type error to master indicates data
-     * inconsistent, * force fullresync to fix it. */
-    if (getClientType(c) == CLIENT_TYPE_MASTER &&
-            isWrongTypeErrorReply(s,len)) {
-        server.gtid_xsync_fullresync_indicator++;
-    }
-}
+
 
 /* Note: uuid interested is effective only once */
 void xsyncUuidInterestedSet(const char *uuid) {

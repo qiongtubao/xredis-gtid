@@ -1,5 +1,5 @@
 #include "xredis_cmdparse.h"
-#include "server.h"
+#include "xredis_gtid_adaptation_version.h"
 
 
 
@@ -86,7 +86,7 @@ static void cmdParseGeoDist(int dbid, struct redisCommand *cmd, robj **argv, int
 void cmdParseKeys(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
     if (argc < 1) return;
     if (cmd == NULL) {
-        cmd = lookupCommand(argv[0]->ptr);
+        cmd = gtidLookupCommandBySds(argv[0]->ptr);
     }
     serverAssert(cmd != NULL);
 
@@ -98,7 +98,7 @@ void cmdParseKeys(int dbid, struct redisCommand *cmd, robj **argv, int argc, voi
     getKeysResult keys = GETKEYS_RESULT_INIT;
     int numkeys = getKeysFromCommand(cmd, argv, argc, &keys);
     for (int i = 0; i < numkeys; i++) {
-        on_key(ctx, dbid, cmd, argv, argc, keys.keys[i], 0, 0, 0, NULL, NULL);
+        on_key(ctx, dbid, cmd, argv, argc, gtidGetKeysResultKeyIndex(&keys, i), 0, 0, 0, NULL, NULL);
     }
     getKeysFreeResult(&keys);
     return;
@@ -108,7 +108,7 @@ void cmdParseBindToCommands(void) {
     int i;
     for (i = 0; cmd_parse_commands[i].name != NULL; i++) {
         sds name = sdsnew(cmd_parse_commands[i].name);
-        struct redisCommand *cmd = lookupCommand(name);
+        struct redisCommand *cmd = gtidLookupCommandBySds(name);
         sdsfree(name);
         if (cmd != NULL) {
             cmd->cmdparse_parse = cmd_parse_commands[i].parse;

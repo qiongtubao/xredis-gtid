@@ -1,0 +1,4 @@
+{
+  "name": "zrevrangebyscore",
+  "parse": "cmdParseZrevrangebyscore"
+}

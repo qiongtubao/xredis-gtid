@@ -1,0 +1,5 @@
+{
+  "name": "lmpop",
+  "count": "cmdCountLmpop",
+  "parse": "cmdParseLmpop"
+}

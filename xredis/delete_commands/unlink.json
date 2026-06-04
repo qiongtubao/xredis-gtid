@@ -1,0 +1,5 @@
+{
+  "name": "unlink",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}

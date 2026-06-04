@@ -4,7 +4,7 @@
 
 /* version 6.x*/
 
-ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size) {
+ssize_t gtidBacklogAppendToSds(long long offset, sds *dst, size_t size) {
     if (server.repl_backlog == NULL || server.repl_backlog_histlen == 0)
         return -1;
 
@@ -78,7 +78,7 @@ void gtidGaplogKeysBuilderAddFromCmd(gtidGaplogKeysBuilder *builder, int dbid, r
 }
 
 
-void mockClientInit(client* mock) {
+void gtidMockClientInit(client* mock) {
     mock->querybuf = sdsempty();
     mock->authenticated = 1;
     mock->argv = NULL;
@@ -89,7 +89,7 @@ void mockClientInit(client* mock) {
     mock->multibulklen = 0;
 }
 
-void mockClientCleanArgv(client* mock) {
+void gtidMockClientCleanArgv(client* mock) {
     if (mock->argv) {
         for (int i = 0; i < mock->argc; i++)
             if (mock->argv[i]) decrRefCount(mock->argv[i]);
@@ -99,8 +99,8 @@ void mockClientCleanArgv(client* mock) {
     }
 }
 
-void mockClientDeinit(client* mock) {
-    mockClientCleanArgv(mock);
+void gtidMockClientDeinit(client* mock) {
+    gtidMockClientCleanArgv(mock);
     sdsfree(mock->querybuf);
     mock->querybuf = NULL;
     mock->qb_pos = 0;

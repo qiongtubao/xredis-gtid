@@ -1,0 +1,4 @@
+{
+  "name": "bitpos",
+  "parse": "cmdParseBitpos"
+}

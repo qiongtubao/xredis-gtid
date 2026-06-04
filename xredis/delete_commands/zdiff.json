@@ -1,0 +1,5 @@
+{
+  "name": "zdiff",
+  "count": "cmdCountZunion",
+  "parse": "cmdParseZunion"
+}

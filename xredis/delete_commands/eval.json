@@ -1,0 +1,5 @@
+{
+  "name": "eval",
+  "count": "cmdCountEval",
+  "parse": "cmdParseEval"
+}

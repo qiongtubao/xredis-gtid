@@ -29,8 +29,11 @@
 #include "server.h"
 #include <gtid.h>
 #include <ctype.h>
+#include "xredis_gtid_adaptation_version.h"
+#define MAX(a, b)	(a) < (b) ? (b) : (a)
 
-/* Full definition of readBacklogIterator (opaque in xredis_gtid.h). */
+/* Full definition of gtidReadBacklogIterator (opaque in xredis_gtid.h). */
+
 
 int replicationSetupSlaveForXFullResync(client *slave, long long offset) {
     int ret = C_OK;
@@ -1201,25 +1204,26 @@ static parsedSyncReply *parseSyncReply(sds reply) {
 
 /* read backlog iterator*/
 #define ONCE_READ_BUF_SIZE 256
-typedef struct readBacklogIterator {
+
+typedef struct gtidReadBacklogIterator {
     client mock;
     long long backlog;   /* -1 = not seeked yet; >=0 = backlog offset for mock.querybuf[mock.qb_pos] */
-} readBacklogIterator;
+} gtidReadBacklogIterator;
 
-void readBacklogIteratorInit(readBacklogIterator *it) {
+void gtidReadBacklogIteratorInit(gtidReadBacklogIterator *it) {
     memset(&it->mock, 0, sizeof(it->mock));
-    mockClientInit(&it->mock);
+    gtidMockClientInit(&it->mock);
     it->mock.bulklen = -1;  /* processMultibulkBuffer 需要 bulklen 初始为 -1（未设置） */
     it->backlog = -1;
 }
 
-void readBacklogIteratorDeinit(readBacklogIterator *it) {
-    mockClientDeinit(&it->mock);
+void gtidReadBacklogIteratorDeinit(gtidReadBacklogIterator *it) {
+    gtidMockClientDeinit(&it->mock);
     it->mock.querybuf = NULL;
     it->backlog = -1;  
 }
 
-void readBacklogIteratorSeekTo(readBacklogIterator *it, long long offset) {
+void gtidReadBacklogIteratorSeekTo(gtidReadBacklogIterator *it, long long offset) {
     serverAssert(offset >= 0);  
 
     if (it->backlog < 0) {
@@ -1245,14 +1249,14 @@ void readBacklogIteratorSeekTo(readBacklogIterator *it, long long offset) {
     it->backlog = offset;
 }
 
-ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
+ssize_t gtidReadBacklogIteratorParseNext(gtidReadBacklogIterator *it,
                                       robj ***out_argv, int *out_argc) {
     serverAssert(it->backlog >= 0);
     serverAssert(out_argv != NULL && out_argc != NULL);
     *out_argv = NULL;
     *out_argc = 0;
 
-    mockClientCleanArgv(&it->mock);
+    gtidMockClientCleanArgv(&it->mock);
 
     size_t buffered = sdslen(it->mock.querybuf) - it->mock.qb_pos;
     size_t total_read = 0;
@@ -1277,13 +1281,13 @@ ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
             return (ssize_t)consumed;
         }
 
-        ssize_t nread = backlogAppendToSds(it->backlog,
+        ssize_t nread = gtidBacklogAppendToSds(it->backlog,
                                             &it->mock.querybuf,
                                             ONCE_READ_BUF_SIZE);
         if (nread <= 0) {
             if (!any_read) return 0; 
             serverLog(LL_WARNING,
-                      "[gaplog] backlogAppendToSds failed mid-cmd at offset %lld",
+                      "[gaplog] gtidBacklogAppendToSds failed mid-cmd at offset %lld",
                       it->backlog);
             
             return -1;
@@ -1316,6 +1320,7 @@ static void gtidParsedCmdListAdd(gtidParsedCmdList *list, client *c) {
     /* move */
     c->argv = NULL;
     c->argc = 0;
+    gtidMockClientMoveClientArgv(c);
 }
 
 static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
@@ -1330,7 +1335,7 @@ static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
 }
 
 void parseMultiCommand(gtidGaplogKeysBuilder *build,
-                       readBacklogIterator *it,
+                       gtidReadBacklogIterator *it,
                        long long select_dbid) {
     serverAssert(it->backlog >= 0);
 
@@ -1339,7 +1344,7 @@ void parseMultiCommand(gtidGaplogKeysBuilder *build,
     while (1) {
         robj **argv;
         int argc;
-        ssize_t consumed = readBacklogIteratorParseNext(it, &argv, &argc);
+        ssize_t consumed = gtidReadBacklogIteratorParseNext(it, &argv, &argc);
         if (consumed <= 0) break;
         serverAssert(argv != NULL && argc > 0);
 
@@ -1444,8 +1449,8 @@ static int saveGapLogEntry(sds uuid, gno_t gno, gtidGaplogKeys *kis) {
 }
 
 void saveGapLogFromGtidSet(gtidSet *mlost) {
-    readBacklogIterator it;
-    readBacklogIteratorInit(&it);
+    gtidReadBacklogIterator it;
+    gtidReadBacklogIteratorInit(&it);
 
     gtidSetIterator gs_iterator;
     gtidSetInitIterator(&gs_iterator, mlost);
@@ -1462,7 +1467,7 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                                                   sdslen(uuid), gno);
                 if (offset < 0) continue;
 
-                readBacklogIteratorSeekTo(&it, offset);
+                gtidReadBacklogIteratorSeekTo(&it, offset);
 
                 long long dbid_from_select = -1;
                 gtidGaplogKeysBuilder builder = GTID_GAPLOG_KEYS_BUILDER_INIT;
@@ -1470,7 +1475,8 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                 while (1) {
                     robj **argv;
                     int argc;
-                    ssize_t consumed = readBacklogIteratorParseNext(&it, &argv, &argc);
+
+                    ssize_t consumed = gtidReadBacklogIteratorParseNext(&it, &argv, &argc);
                     if (consumed <= 0) break;
 
                     sds cmd_name = (sds)argv[0]->ptr;
@@ -1509,7 +1515,7 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
     }
     gtidSetDeinitIterator(&gs_iterator);
 
-    readBacklogIteratorDeinit(&it);
+    gtidReadBacklogIteratorDeinit(&it);
 }
 
 int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
@@ -2259,102 +2265,103 @@ int gtidTest(int argc, char **argv, int accurate) {
         zfree(gap_log);
     }
 
-    TEST("gtid - readBacklogIterator init and deinit") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator init and deinit") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
         test_assert(it.backlog == -1);
         test_assert(it.mock.querybuf != NULL);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
         test_assert(it.backlog == -1);  
         test_assert(it.mock.querybuf == NULL);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo basic (init + no-op)") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+
+    TEST("gtid - gtidReadBacklogIterator SeekTo basic (init + no-op)") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
         test_assert(it.backlog == -1);
 
-        readBacklogIteratorSeekTo(&it, 100);
+        gtidReadBacklogIteratorSeekTo(&it, 100);
         test_assert(it.backlog == 100);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
         /* no-op seek：offset == cur */
-        readBacklogIteratorSeekTo(&it, 100);
+        gtidReadBacklogIteratorSeekTo(&it, 100);
         test_assert(it.backlog == 100);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo forward within buffer") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator SeekTo forward within buffer") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
 
-        readBacklogIteratorSeekTo(&it, 0);
+        gtidReadBacklogIteratorSeekTo(&it, 0);
         it.backlog = 1200;
         it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 200);  
         it.mock.qb_pos = 0;
 
 
-        readBacklogIteratorSeekTo(&it, 1050);
+        gtidReadBacklogIteratorSeekTo(&it, 1050);
         test_assert(it.backlog == 1200);
         test_assert(it.mock.qb_pos == 0);  
         test_assert(sdslen(it.mock.querybuf) == 150);  
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo forward past buffer (clear+seek)") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator SeekTo forward past buffer (clear+seek)") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
 
         it.backlog = 1000;
         it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 100);  /* [1000, 1100) */
         it.mock.qb_pos = 0;
 
-        readBacklogIteratorSeekTo(&it, 1200);
+        gtidReadBacklogIteratorSeekTo(&it, 1200);
         test_assert(it.backlog == 1200);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo rewind (clear+seek)") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator SeekTo rewind (clear+seek)") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
 
         it.backlog = 1000;
         it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 200);
         it.mock.qb_pos = 0;
 
-        readBacklogIteratorSeekTo(&it, 500);
+        gtidReadBacklogIteratorSeekTo(&it, 500);
         test_assert(it.backlog == 500);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator ParseNext single command") {
+    TEST("gtid - gtidReadBacklogIterator ParseNext single command") {
         server.repl_backlog_size = 2048;
         /* Set up backlog with a single SET command */
         if (server.repl_backlog == NULL) ctrip_createReplicationBacklog();
         sds cmd = sdsnew("*3\r\n$3\r\nset\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
         feedReplicationBacklog(cmd, sdslen(cmd));
-        long long start_off = server.repl_backlog_off;
+        long long start_off = 0; 
 
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
-        readBacklogIteratorSeekTo(&it, 1);
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
+        gtidReadBacklogIteratorSeekTo(&it, 1);
 
         robj **argv;
         int argc;
-        ssize_t consumed = readBacklogIteratorParseNext(&it, &argv, &argc);
+        ssize_t consumed = gtidReadBacklogIteratorParseNext(&it, &argv, &argc);
         test_assert(consumed > 0);
         test_assert(argc == 3);
         test_assert(!strcasecmp(argv[0]->ptr, "set"));
@@ -2362,7 +2369,7 @@ int gtidTest(int argc, char **argv, int accurate) {
         test_assert(!strcasecmp(argv[2]->ptr, "value"));
         test_assert(it.backlog == start_off + consumed);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
         sdsfree(cmd);
     }
 

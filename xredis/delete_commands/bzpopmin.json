@@ -1,0 +1,5 @@
+{
+  "name": "bzpopmin",
+  "count": "cmdCountBzpop",
+  "parse": "cmdParseBzpopmin"
+}
