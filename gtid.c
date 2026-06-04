@@ -1005,6 +1005,14 @@ gtidSeq *gtidSeqCreate() {
     return seq;
 }
 
+void gtidSeqRebaseOffset(gtidSeq *seq, const char *uuid, size_t uuid_len, size_t offset) {
+    gtidSegment *seg = seq->firstseg;
+    while (seg) {
+        seg->base_offset += offset;
+        seg = seg->next;
+    }
+}
+
 void gtidSeqDestroy(gtidSeq *seq) {
     gtidSegment *seg, *next;
 

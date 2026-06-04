@@ -36,6 +36,7 @@
 #include "gtid.h"
 #include "dict.h"
 
+
 typedef struct client client;
 typedef struct redisObject robj;
 typedef struct _rio rio;
@@ -150,10 +151,9 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs);
 void propagateArgsDeinit(propagateArgs *pargs);
 
 void ctrip_createReplicationBacklog(void);
-void ctrip_resizeReplicationBacklog(long long newsize);
 void ctrip_freeReplicationBacklog(void);
 void ctrip_replicationFeedSlaves(list *slaves, int dictid, robj **argv, int argc, const char *uuid, size_t uuid_len, gno_t gno, long long offset);
-void ctrip_replicationFeedSlavesFromMasterStream(list *slaves, char *buf, size_t buflen, const char *uuid, size_t uuid_len, gno_t gno, long long offset);
+
 void ctrip_feedAppendOnlyFile(struct redisCommand *cmd, int dictid, robj **argv, int argc);
 
 typedef struct gtidInitialInfo {
@@ -236,11 +236,11 @@ void gtidCommand(client *c);
 void gtidxCommand(client *c);
 char *ctrip_receiveSynchronousResponse(connection *conn);
 int ctrip_replicationSetupSlaveForFullResync(client *slave, long long offset);
-int ctrip_masterTryPartialResynchronization(client *c);
+
 int ctrip_addReplyReplicationBacklog(client *c, long long offset, long long *added);
 int ctrip_slaveTryPartialResynchronizationWrite(connection *conn);
 int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply);
-void ctrip_afterErrorReply(client *c, const char *s, size_t len);
+
 
 
 /* Expose functions that used by gtid */
@@ -250,10 +250,10 @@ int cancelReplicationHandshake(int reconnect);
 void replicationDiscardCachedMaster(void);
 void replicationCreateMasterClient(connection *conn, int dbid);
 void aofRewriteBufferAppend(unsigned char *s, unsigned long len);
-int masterTryPartialResynchronization(client *c);
+
 sds catAppendOnlyGenericCommand(sds dst, int argc, robj **argv);
 long long addReplyReplicationBacklog(client *c, long long offset);
-void afterErrorReply(client *c, const char *s, size_t len);
+// void afterErrorReply(client *c, const char *s, size_t len);
 ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t vallen);
 
 #define OBJ_UNKNOWN 255
@@ -265,8 +265,8 @@ ssize_t rdbSaveAuxField(rio *rdb, void *key, size_t keylen, void *val, size_t va
  * ================================================================ */
 typedef struct gtidGaplogKey {
   unsigned long long dbid:4;      /* max 16 db */
-  unsigned long long key_type:4;  /* OBJ_STRING/OBJ_LIST/OBJ_SET/OBJ_ZSET/OBJ_HASH */
-  unsigned long long subkeys_count:56;
+  unsigned long long key_type:8;  /* OBJ_STRING/OBJ_LIST/OBJ_SET/OBJ_ZSET/OBJ_HASH */
+  unsigned long long subkeys_count:52;
   sds key;                        /* key (sdsdup ) */
   sds* subkeys;                   /* subkeys (sdsdup ) */
 } gtidGaplogKey;
@@ -328,23 +328,20 @@ gno_t gtidGaplogHistoryNext(gtidGaplogHistoryIterator* iter,
 void gtidGaplogHistoryIteratorSeek(gtidGaplogHistoryIterator* iter, gno_t gno);
 void gtidGaplogDeinitHistoryIterator(gtidGaplogHistoryIterator* iter);
 
-/* readBacklogIterator: iterate commands from replication backlog with querybuf reuse.
+/* gtidReadBacklogIterator: iterate commands from replication backlog with querybuf reuse.
  * Use Init/SeekTo/ParseNext/Deinit. backlog == -1 means "not seeked yet".
  * Full struct definition is in xredis_gtid_repl.c (where `client` is complete). */
-typedef struct readBacklogIterator readBacklogIterator;
-
-void mockClientInit(client* c);
-void mockClientDeinit(client* c);
-void mockClientCleanArgv(client* c);
-
-void readBacklogIteratorInit(readBacklogIterator *it);
-void readBacklogIteratorDeinit(readBacklogIterator *it);
-void readBacklogIteratorSeekTo(readBacklogIterator *it, long long offset);
-ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
+typedef struct gtidReadBacklogIterator gtidReadBacklogIterator;
+void gtidReadBacklogIteratorInit(gtidReadBacklogIterator *it);
+void gtidReadBacklogIteratorDeinit(gtidReadBacklogIterator *it);
+void gtidReadBacklogIteratorSeekTo(gtidReadBacklogIterator *it, long long offset);
+ssize_t gtidReadBacklogIteratorParseNext(gtidReadBacklogIterator *it,
                                       robj ***out_argv, int *out_argc);
 
+
+
 void parseMultiCommand(gtidGaplogKeysBuilder *build,
-                       readBacklogIterator *it,
+                       gtidReadBacklogIterator *it,
                        long long select_dbid);
 int parseGtidCommand(gtidGaplogKeysBuilder *builder, robj **argv, int argc);
 
@@ -361,7 +358,7 @@ int processMultibulkBuffer(client* c);
 
 /*  adaptation for version diff */
 /* backlog data copy to buffer (version)*/
-ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size);
+size_t gtidBacklogAppendToSds(long long offset, sds *dst, size_t size);
 
 /* gtid test */
 int gtidTest(int argc, char **argv, int accurate);

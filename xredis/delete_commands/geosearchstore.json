@@ -1,0 +1,4 @@
+{
+  "name": "geosearchstore",
+  "parse": "cmdParseTwoKeys"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "msetnx",
+  "count": "cmdCountMset",
+  "parse": "cmdParseMset"
+}

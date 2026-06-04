@@ -1,0 +1,4 @@
+{
+  "name": "rpoplpush",
+  "parse": "cmdParseTwoKeys"
+}

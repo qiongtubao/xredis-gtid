@@ -1,0 +1,5 @@
+{
+  "name": "sinterstore",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}

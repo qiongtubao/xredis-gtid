@@ -1,0 +1,5 @@
+{
+  "name": "xinfo",
+  "count": "cmdCountSingleKey",
+  "parse": "cmdParseXinfo"
+}

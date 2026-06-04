@@ -1,0 +1,4 @@
+{
+  "name": "ltrim",
+  "parse": "cmdParseLtrim"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "mget",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}

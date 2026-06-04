@@ -1,0 +1,5 @@
+{
+  "name": "xreadgroup",
+  "count": "cmdCountXreadgroup",
+  "parse": "cmdParseXreadgroup"
+}

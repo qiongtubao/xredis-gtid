@@ -1,0 +1,5 @@
+{
+  "name": "migrate",
+  "count": "cmdCountSingleKey",
+  "parse": "cmdParseMigrate"
+}

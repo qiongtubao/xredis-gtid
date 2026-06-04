@@ -1,0 +1,4 @@
+{
+  "name": "bitcount",
+  "parse": "cmdParseBitcount"
+}

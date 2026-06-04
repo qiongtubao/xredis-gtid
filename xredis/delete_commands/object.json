@@ -1,0 +1,5 @@
+{
+  "name": "object",
+  "count": "cmdCountSingleKey",
+  "parse": "cmdParseObject"
+}

@@ -1,0 +1,4 @@
+{
+  "name": "rpop",
+  "parse": "cmdParseRpop"
+}

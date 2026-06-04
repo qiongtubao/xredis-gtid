@@ -29,8 +29,11 @@
 #include "server.h"
 #include <gtid.h>
 #include <ctype.h>
+#include "xredis_gtid_adaptation_version.h"
+#define MAX(a, b)	(a) < (b) ? (b) : (a)
 
-/* Full definition of readBacklogIterator (opaque in xredis_gtid.h). */
+/* Full definition of gtidReadBacklogIterator (opaque in xredis_gtid.h). */
+
 
 int replicationSetupSlaveForXFullResync(client *slave, long long offset) {
     int ret = C_OK;
@@ -85,7 +88,6 @@ int ctrip_replicationSetupSlaveForFullResync(client *slave, long long offset) {
     else
         return replicationSetupSlaveForXFullResync(slave, offset);
 }
-
 #define GTID_XSYNC_MAX_REPLY_SIZE (64*1024)
 
 /* XCONTINUE reply could exceed 256 byte. */
@@ -104,24 +106,6 @@ char *ctrip_receiveSynchronousResponse(connection *conn) {
     return response;
 }
 
-typedef struct syncRequest {
-    int mode;
-    union {
-        struct {
-            sds replid;
-            long long offset;
-        } p; /* psync */
-        struct {
-            sds uuid_interested;
-            gtidSet *gtid_slave;
-            gtidSet *gtid_lost;
-            long long maxgap;
-        } x; /* xsync */
-        struct {
-            sds msg;
-        } i; /* invalid */
-    };
-} syncRequest;
 
 syncRequest *syncRequestNew() {
     syncRequest *request = zcalloc(sizeof(syncRequest));
@@ -242,40 +226,7 @@ syncRequest *masterParseSyncRequest(client *c) {
     return request;
 }
 
-#define SYNC_ACTION_NOP         0
-#define SYNC_ACTION_XCONTINUE   1
-#define SYNC_ACTION_CONTINUE    2
-#define SYNC_ACTION_FULL        3
 
-typedef struct syncResult {
-    int request_mode;
-    int action;
-    long long offset; /* send offset start */
-    long long limit; /* send offset limit */
-    sds msg;
-    union {
-        /* Note that there's no need to save replid/gtid.lost for fullresync
-         * or xfullresync, fullresync should use current replid/gtid.lost
-         * save in server instead of replid/gtid snapshot when ana reqeust. */
-        struct {
-            sds replid;
-            long long reploff;
-            gtidSet *gtid_cont;
-            gtidSet *delta_lost;
-        } xc; /* xcontinue */
-        struct {
-            sds replid;
-            /* reploff that slave has logically received. will be propagate
-             * to slave when xcontinue => continue to align repl reploff
-             * of master and slave.
-             * Note that to keep compatible with origin replication proptocol,
-             * when reploff < 0, it will not be propragte to slave. */
-            long long reploff;
-            /* gtid.set-lost might exists when xsync => psync. */
-            gtidSet *delta_lost;
-        } cc; /* continue */
-    };
-} syncResult;
 
 syncResult *syncResultNew() {
     syncResult *result = zcalloc(sizeof(syncResult));
@@ -314,14 +265,18 @@ void masterAnaPsyncRequest(syncResult *result, syncRequest *request) {
         return;
     }
 
-    if (!server.repl_backlog ||
-        psync_offset < server.repl_backlog_off ||
-        psync_offset > (server.repl_backlog_off+server.repl_backlog_histlen)) {
+    if (server.repl_backlog == NULL) {
+        result->action = SYNC_ACTION_FULL;
+        result->msg = sdsnew("no backlog");
+        return;
+    }
+    if (psync_offset < gtidGetBacklogOffset() ||
+        psync_offset > (gtidGetBacklogOffset()+gtidGetBacklogHistlen())) {
         result->action = SYNC_ACTION_FULL;
         result->msg = sdscatprintf(sdsempty(),
                 "psync offset(%lld) not in backlog [%lld,%lld)",
-                psync_offset, server.repl_backlog_off,
-                server.repl_backlog_off+server.repl_backlog_histlen);
+                psync_offset, gtidGetBacklogOffset(),
+                gtidGetBacklogOffset()+gtidGetBacklogHistlen());
         return;
     }
 
@@ -345,7 +300,7 @@ void masterAnaPsyncRequest(syncResult *result, syncRequest *request) {
             if (slr.locate_type == LOCATE_TYPE_PREV) {
                 result->action = SYNC_ACTION_CONTINUE;
                 result->limit = slr.p.limit;
-                result->cc.replid = sdsnew(replid1);
+                result->cc.replid = sdsnew(server.replid);
                 result->cc.reploff = -1; /* no need to align reploff */
                 result->msg = sdsnew("prior psync => xsync");
             } else {
@@ -594,34 +549,6 @@ syncResult *masterAnaSyncRequest(syncRequest *request) {
     return result;
 }
 
-typedef void (*consume_cb)(char *p, long long thislen, void *pd);
-
-/* Check adReplyReplicationBacklog for more details */
-long long consumeReplicationBacklogLimited(long long offset, long long limit,
-         consume_cb cb, void *pd) {
-    long long added = 0, j, skip, len;
-    serverAssert(limit >= 0 && offset >= server.repl_backlog_off);
-    if (server.repl_backlog_histlen == 0) return 0;
-    skip = offset - server.repl_backlog_off;
-    j = (server.repl_backlog_idx +
-        (server.repl_backlog_size-server.repl_backlog_histlen)) %
-        server.repl_backlog_size;
-    j = (j + skip) % server.repl_backlog_size;
-    len = server.repl_backlog_histlen - skip;
-    len = len < limit ? len : limit; /* limit bytes to copy */
-    while(len) {
-        long long thislen =
-            ((server.repl_backlog_size - j) < len) ?
-            (server.repl_backlog_size - j) : len;
-        cb(server.repl_backlog + j, thislen, pd);
-        len -= thislen;
-        j = 0;
-        added += thislen;
-    }
-
-    return added;
-}
-
 static void consumeReplicationBacklogLimitedAddReplyCb(char *p,
         long long thislen, void *pd) {
     addReplySds((client*)pd, sdsnewlen(p,thislen));
@@ -653,136 +580,11 @@ long long copyReplicationBacklogLimited(char *buf, long long offset,
             consumeReplicationBacklogLimitedCopyCb,&pd);
 }
 
-/* see masterTryPartialResynchronization for more details. */
-void masterSetupPartialSynchronization(client *c, long long offset,
-        long long limit, char *buf, int buflen) {
-    long long sent;
 
-    if (server.repl_backlog == NULL) ctrip_createReplicationBacklog();
 
-    c->flags |= CLIENT_SLAVE;
-    c->replstate = SLAVE_STATE_ONLINE;
-    c->repl_ack_time = server.unixtime;
-    c->repl_put_online_on_ack = 0;
-    listAddNodeTail(server.slaves,c);
 
-    if (connWrite(c->conn,buf,buflen) != buflen) {
-        freeClientAsync(c);
-        return;
-    }
 
-    if (limit > 0) {
-        sent = addReplyReplicationBacklogLimited(c,offset,limit);
-    } else {
-        sent = addReplyReplicationBacklog(c,offset);
-    }
 
-    serverLog(LL_NOTICE,
-        "[gtid] Sent %lld bytes of backlog starting from offset %lld limit %lld.",
-        sent, offset, limit);
-
-    if (limit > 0) {
-        c->flags |= CLIENT_CLOSE_AFTER_REPLY;
-        serverLog(LL_NOTICE,
-                "[gtid] Disconnect slave %s to notify repl mode switched.",
-                replicationGetSlaveName(c));
-        return;
-    }
-
-    /* Note that we don't need to set the selected DB at server.slaveseldb
-     * to -1 to force the master to emit SELECT:
-     * a) xcontinue: db selectd by gtid argv
-     * b) continue : db already saved in cached_master */
-
-    refreshGoodSlavesCount();
-
-    moduleFireServerEvent(REDISMODULE_EVENT_REPLICA_CHANGE,
-                          REDISMODULE_SUBEVENT_REPLICA_CHANGE_ONLINE,
-                          NULL);
-}
-
-int masterReplySyncRequest(client *c, syncResult *result) {
-    int ret = result->action == SYNC_ACTION_FULL ? C_ERR : C_OK;
-
-    if (result->action == SYNC_ACTION_NOP) {
-        serverLog(LL_NOTICE,
-                "[%s] Partial sync request from %s handle by vanilla redis.",
-                replModeName(result->request_mode), replicationGetSlaveName(c));
-        ret = masterTryPartialResynchronization(c);
-    } else if (result->action == SYNC_ACTION_XCONTINUE) {
-        char *buf;
-        int buflen;
-        const char *master_uuid;
-        size_t master_uuid_len;
-        sds gtid_cont_repr = gtidSetQuoteIfEmpty(gtidSetDump(result->xc.gtid_cont));
-        sds gtid_lost_repr = gtidSetQuoteIfEmpty(gtidSetDump(server.gtid_lost));
-
-        serverLog(LL_NOTICE,
-                "[%s] Partial sync request from %s accepted: %s, "
-                "offset=%lld, limit=%lld, gtid.set-cont=%s, gtid.set-lost=%s, master.uuid=%s",
-                replModeName(result->request_mode),replicationGetSlaveName(c),
-                result->msg, result->offset, result->limit,
-                gtid_cont_repr, gtid_lost_repr, server.uuid);
-
-        if (result->xc.delta_lost)
-            serverReplStreamUpdateXsync(result->xc.delta_lost,c,NULL,NULL,-1);
-
-        master_uuid = getMasterUuid(&master_uuid_len);
-
-        buflen = sdslen(gtid_cont_repr) + sdslen(gtid_lost_repr) + 256;
-        buf = zcalloc(buflen);
-        buflen = snprintf(buf,buflen,
-                "+XCONTINUE GTID.SET %.*s GTID.LOST %.*s MASTER.UUID %.*s "
-                "REPLID %s REPLOFF %lld\r\n",
-                (int)sdslen(gtid_cont_repr),gtid_cont_repr,
-                (int)sdslen(gtid_lost_repr),gtid_lost_repr,
-                (int)master_uuid_len,master_uuid,
-                result->xc.replid,result->xc.reploff);
-        masterSetupPartialSynchronization(c,result->offset,
-                result->limit,buf,buflen);
-
-        sdsfree(gtid_cont_repr);
-        sdsfree(gtid_lost_repr);
-        zfree(buf);
-    } else if (result->action == SYNC_ACTION_CONTINUE) {
-        char buf[128];
-        int buflen;
-
-        serverLog(LL_NOTICE, "[%s] Partial sync request from %s accepted: %s, "
-                "offset=%lld, limit=%lld, cc.replid=%s, cc.reploff=%lld",
-                replModeName(result->request_mode),replicationGetSlaveName(c),
-                result->msg, result->offset, result->limit,
-                result->cc.replid, result->cc.reploff);
-
-        if (result->cc.delta_lost)
-            serverReplStreamUpdateXsync(result->cc.delta_lost,c,NULL,NULL,-1);
-
-        if (result->cc.reploff < 0) {
-            buflen = snprintf(buf,sizeof(buf),"+CONTINUE %s\r\n",
-                    result->cc.replid);
-        } else {
-            buflen = snprintf(buf,sizeof(buf),"+CONTINUE %s %lld\r\n",
-                    result->cc.replid, result->cc.reploff);
-        }
-        masterSetupPartialSynchronization(c,result->offset,
-                result->limit,buf,buflen);
-    } else {
-        serverLog(LL_NOTICE, "[%s] Partial sync request from %s rejected: %s",
-                replModeName(result->request_mode),replicationGetSlaveName(c),
-                result->msg);
-    }
-
-    return ret;
-}
-
-int ctrip_masterTryPartialResynchronization(client *c) {
-    syncRequest *request = masterParseSyncRequest(c);
-    syncResult *result = masterAnaSyncRequest(request);
-    int ret = masterReplySyncRequest(c,result);
-    syncRequestFree(request);
-    syncResultFree(result);
-    return ret;
-}
 
 const char *xsyncUuidInterestedGet(void);
 
@@ -1201,25 +1003,26 @@ static parsedSyncReply *parseSyncReply(sds reply) {
 
 /* read backlog iterator*/
 #define ONCE_READ_BUF_SIZE 256
-typedef struct readBacklogIterator {
+
+typedef struct gtidReadBacklogIterator {
     client mock;
     long long backlog;   /* -1 = not seeked yet; >=0 = backlog offset for mock.querybuf[mock.qb_pos] */
-} readBacklogIterator;
+} gtidReadBacklogIterator;
 
-void readBacklogIteratorInit(readBacklogIterator *it) {
+void gtidReadBacklogIteratorInit(gtidReadBacklogIterator *it) {
     memset(&it->mock, 0, sizeof(it->mock));
-    mockClientInit(&it->mock);
+    gtidMockClientInit(&it->mock);
     it->mock.bulklen = -1;  /* processMultibulkBuffer 需要 bulklen 初始为 -1（未设置） */
     it->backlog = -1;
 }
 
-void readBacklogIteratorDeinit(readBacklogIterator *it) {
-    mockClientDeinit(&it->mock);
+void gtidReadBacklogIteratorDeinit(gtidReadBacklogIterator *it) {
+    gtidMockClientDeinit(&it->mock);
     it->mock.querybuf = NULL;
     it->backlog = -1;  
 }
 
-void readBacklogIteratorSeekTo(readBacklogIterator *it, long long offset) {
+void gtidReadBacklogIteratorSeekTo(gtidReadBacklogIterator *it, long long offset) {
     serverAssert(offset >= 0);  
 
     if (it->backlog < 0) {
@@ -1245,14 +1048,14 @@ void readBacklogIteratorSeekTo(readBacklogIterator *it, long long offset) {
     it->backlog = offset;
 }
 
-ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
+ssize_t gtidReadBacklogIteratorParseNext(gtidReadBacklogIterator *it,
                                       robj ***out_argv, int *out_argc) {
     serverAssert(it->backlog >= 0);
     serverAssert(out_argv != NULL && out_argc != NULL);
     *out_argv = NULL;
     *out_argc = 0;
 
-    mockClientCleanArgv(&it->mock);
+    gtidMockClientCleanArgv(&it->mock);
 
     size_t buffered = sdslen(it->mock.querybuf) - it->mock.qb_pos;
     size_t total_read = 0;
@@ -1277,13 +1080,13 @@ ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
             return (ssize_t)consumed;
         }
 
-        ssize_t nread = backlogAppendToSds(it->backlog,
+        ssize_t nread = gtidBacklogAppendToSds(it->backlog,
                                             &it->mock.querybuf,
                                             ONCE_READ_BUF_SIZE);
         if (nread <= 0) {
             if (!any_read) return 0; 
             serverLog(LL_WARNING,
-                      "[gaplog] backlogAppendToSds failed mid-cmd at offset %lld",
+                      "[gaplog] gtidBacklogAppendToSds failed mid-cmd at offset %lld",
                       it->backlog);
             
             return -1;
@@ -1316,6 +1119,7 @@ static void gtidParsedCmdListAdd(gtidParsedCmdList *list, client *c) {
     /* move */
     c->argv = NULL;
     c->argc = 0;
+    gtidMockClientMoveClientArgv(c);
 }
 
 static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
@@ -1330,7 +1134,7 @@ static void gtidParsedCmdListCleanup(gtidParsedCmdList *list) {
 }
 
 void parseMultiCommand(gtidGaplogKeysBuilder *build,
-                       readBacklogIterator *it,
+                       gtidReadBacklogIterator *it,
                        long long select_dbid) {
     serverAssert(it->backlog >= 0);
 
@@ -1339,7 +1143,7 @@ void parseMultiCommand(gtidGaplogKeysBuilder *build,
     while (1) {
         robj **argv;
         int argc;
-        ssize_t consumed = readBacklogIteratorParseNext(it, &argv, &argc);
+        ssize_t consumed = gtidReadBacklogIteratorParseNext(it, &argv, &argc);
         if (consumed <= 0) break;
         serverAssert(argv != NULL && argc > 0);
 
@@ -1444,8 +1248,8 @@ static int saveGapLogEntry(sds uuid, gno_t gno, gtidGaplogKeys *kis) {
 }
 
 void saveGapLogFromGtidSet(gtidSet *mlost) {
-    readBacklogIterator it;
-    readBacklogIteratorInit(&it);
+    gtidReadBacklogIterator it;
+    gtidReadBacklogIteratorInit(&it);
 
     gtidSetIterator gs_iterator;
     gtidSetInitIterator(&gs_iterator, mlost);
@@ -1462,7 +1266,7 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                                                   sdslen(uuid), gno);
                 if (offset < 0) continue;
 
-                readBacklogIteratorSeekTo(&it, offset);
+                gtidReadBacklogIteratorSeekTo(&it, offset);
 
                 long long dbid_from_select = -1;
                 gtidGaplogKeysBuilder builder = GTID_GAPLOG_KEYS_BUILDER_INIT;
@@ -1470,7 +1274,8 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                 while (1) {
                     robj **argv;
                     int argc;
-                    ssize_t consumed = readBacklogIteratorParseNext(&it, &argv, &argc);
+
+                    ssize_t consumed = gtidReadBacklogIteratorParseNext(&it, &argv, &argc);
                     if (consumed <= 0) break;
 
                     sds cmd_name = (sds)argv[0]->ptr;
@@ -1509,7 +1314,7 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
     }
     gtidSetDeinitIterator(&gs_iterator);
 
-    readBacklogIteratorDeinit(&it);
+    gtidReadBacklogIteratorDeinit(&it);
 }
 
 int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
@@ -1684,7 +1489,7 @@ int gtidTest(int argc, char **argv, int accurate) {
 
     int error = 0;
     server.maxmemory_policy = MAXMEMORY_FLAG_LFU;
-    if (!server.logfile) server.logfile = zstrdup(CONFIG_DEFAULT_LOGFILE);
+    if (!server.logfile) server.logfile = zstrdup("");
 
     TEST("gtid - parse xsync request") {
         syncRequest *request = syncRequestNew();
@@ -2259,102 +2064,103 @@ int gtidTest(int argc, char **argv, int accurate) {
         zfree(gap_log);
     }
 
-    TEST("gtid - readBacklogIterator init and deinit") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator init and deinit") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
         test_assert(it.backlog == -1);
         test_assert(it.mock.querybuf != NULL);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
         test_assert(it.backlog == -1);  
         test_assert(it.mock.querybuf == NULL);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo basic (init + no-op)") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+
+    TEST("gtid - gtidReadBacklogIterator SeekTo basic (init + no-op)") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
         test_assert(it.backlog == -1);
 
-        readBacklogIteratorSeekTo(&it, 100);
+        gtidReadBacklogIteratorSeekTo(&it, 100);
         test_assert(it.backlog == 100);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
         /* no-op seek：offset == cur */
-        readBacklogIteratorSeekTo(&it, 100);
+        gtidReadBacklogIteratorSeekTo(&it, 100);
         test_assert(it.backlog == 100);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo forward within buffer") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator SeekTo forward within buffer") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
 
-        readBacklogIteratorSeekTo(&it, 0);
+        gtidReadBacklogIteratorSeekTo(&it, 0);
         it.backlog = 1200;
         it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 200);  
         it.mock.qb_pos = 0;
 
 
-        readBacklogIteratorSeekTo(&it, 1050);
+        gtidReadBacklogIteratorSeekTo(&it, 1050);
         test_assert(it.backlog == 1200);
         test_assert(it.mock.qb_pos == 0);  
         test_assert(sdslen(it.mock.querybuf) == 150);  
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo forward past buffer (clear+seek)") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator SeekTo forward past buffer (clear+seek)") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
 
         it.backlog = 1000;
         it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 100);  /* [1000, 1100) */
         it.mock.qb_pos = 0;
 
-        readBacklogIteratorSeekTo(&it, 1200);
+        gtidReadBacklogIteratorSeekTo(&it, 1200);
         test_assert(it.backlog == 1200);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator SeekTo rewind (clear+seek)") {
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
+    TEST("gtid - gtidReadBacklogIterator SeekTo rewind (clear+seek)") {
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
 
         it.backlog = 1000;
         it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 200);
         it.mock.qb_pos = 0;
 
-        readBacklogIteratorSeekTo(&it, 500);
+        gtidReadBacklogIteratorSeekTo(&it, 500);
         test_assert(it.backlog == 500);
         test_assert(sdslen(it.mock.querybuf) == 0);
         test_assert(it.mock.qb_pos == 0);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
     }
 
-    TEST("gtid - readBacklogIterator ParseNext single command") {
+    TEST("gtid - gtidReadBacklogIterator ParseNext single command") {
         server.repl_backlog_size = 2048;
         /* Set up backlog with a single SET command */
         if (server.repl_backlog == NULL) ctrip_createReplicationBacklog();
         sds cmd = sdsnew("*3\r\n$3\r\nset\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
-        feedReplicationBacklog(cmd, sdslen(cmd));
-        long long start_off = server.repl_backlog_off;
+        feedReplicationBuffer(cmd, sdslen(cmd));
+        long long start_off = 0; 
 
-        readBacklogIterator it;
-        readBacklogIteratorInit(&it);
-        readBacklogIteratorSeekTo(&it, 1);
+        gtidReadBacklogIterator it;
+        gtidReadBacklogIteratorInit(&it);
+        gtidReadBacklogIteratorSeekTo(&it, 1);
 
         robj **argv;
         int argc;
-        ssize_t consumed = readBacklogIteratorParseNext(&it, &argv, &argc);
+        ssize_t consumed = gtidReadBacklogIteratorParseNext(&it, &argv, &argc);
         test_assert(consumed > 0);
         test_assert(argc == 3);
         test_assert(!strcasecmp(argv[0]->ptr, "set"));
@@ -2362,7 +2168,7 @@ int gtidTest(int argc, char **argv, int accurate) {
         test_assert(!strcasecmp(argv[2]->ptr, "value"));
         test_assert(it.backlog == start_off + consumed);
 
-        readBacklogIteratorDeinit(&it);
+        gtidReadBacklogIteratorDeinit(&it);
         sdsfree(cmd);
     }
 

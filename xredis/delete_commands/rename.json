@@ -1,0 +1,5 @@
+{
+  "name": "rename",
+  "count": "cmdCountTwoKeys",
+  "parse": "cmdParseTwoKeys"
+}

@@ -28,6 +28,7 @@
 
 #include "server.h"
 #include <gtid.h>
+#include "xredis_gtid_adaptation_version.h"
 #include <ctype.h>
 
 int isGtidExecCommand(client* c) {
@@ -167,7 +168,7 @@ void gtidCommand(client *c) {
     c->argv = newargv;
 
     struct redisCommand* orig_cmd = c->cmd, *orig_lastcmd = c->lastcmd;
-    c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+    c->cmd = c->lastcmd = gtidLookupCommandBySds(c->argv[0]->ptr);
     if (!c->cmd) {
         sds args = sdsempty();
         int i;
@@ -182,9 +183,9 @@ void gtidCommand(client *c) {
     } else if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
                (c->argc < -c->cmd->arity)) {
         serverLog(LL_WARNING,"wrong number of arguments for '%s' command",
-            c->cmd->name);
+            gtidRedisCommandGetName(c->cmd));
         rejectCommandFormat(c,"wrong number of arguments for '%s' command",
-            c->cmd->name);
+            gtidRedisCommandGetName(c->cmd));
         goto end;
     }
 
@@ -234,33 +235,9 @@ void clearMasterUuid() {
     server.master_uuid_len = CONFIG_RUN_ID_SIZE;
 }
 
-static inline int isWrongTypeErrorReply(const char *s, size_t len) {
-    const char *swaperrmsg = "Swap failed (code=-206)";
-    const char *wterrmsg = "WRONGTYPE";
-    size_t swaplen = 23, wtlen = 9;
 
-    if (len > 0 && s[0] == '-') {
-        s++;
-        len--;
-    }
 
-    if ( (len >= swaplen && !memcmp(s,swaperrmsg,swaplen)) ||
-            (len >= wtlen && !memcmp(s,wterrmsg,wtlen)) )
-        return 1;
-    else
-        return 0;
-}
 
-void ctrip_afterErrorReply(client *c, const char *s, size_t len) {
-    afterErrorReply(c,s,len);
-    if (server.repl_mode->mode != REPL_MODE_XSYNC) return;
-    /* Replica sending wrong type error to master indicates data
-     * inconsistent, * force fullresync to fix it. */
-    if (getClientType(c) == CLIENT_TYPE_MASTER &&
-            isWrongTypeErrorReply(s,len)) {
-        server.gtid_xsync_fullresync_indicator++;
-    }
-}
 
 /* Note: uuid interested is effective only once */
 void xsyncUuidInterestedSet(const char *uuid) {

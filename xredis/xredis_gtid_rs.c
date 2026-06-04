@@ -28,15 +28,10 @@
 
 #include "server.h"
 #include <gtid.h>
+#include "xredis_gtid_adaptation_version.h"
 #include <ctype.h>
 
-void propagateArgsInit(propagateArgs *pargs, struct redisCommand *cmd,
-        int dbid, robj **argv, int argc) {
-    pargs->orig_cmd = cmd;
-    pargs->orig_argv = argv;
-    pargs->orig_argc = argc;
-    pargs->orig_dbid = dbid;
-}
+
 
 /* Prepare to feed:
  * 1. rewrite to gtid... if needed: set k v  -> gtid {gtid_repr} {dbid} set k v
@@ -57,7 +52,7 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs) {
 
         /* afterPropagateExec could be called before calling propagate()
          * for exec, so we clear gtid_xxx_at_multi here. */
-        if (pargs->orig_cmd == server.execCommand ||
+        if (pargs->orig_cmd->proc == execCommand ||
                 (pargs->orig_cmd->proc == gtidCommand &&
                  strcasecmp(pargs->orig_argv[3]->ptr, "exec") == 0)) {
             server.gtid_dbid_at_multi = -1;
@@ -85,8 +80,8 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs) {
             !server.gtid_enabled ||
             pargs->orig_cmd->proc == gtidCommand ||
             pargs->orig_cmd->proc == publishCommand ||
-            (server.propagate_in_transaction &&
-             pargs->orig_cmd != server.execCommand)) {
+            (gtidIsInMulti() &&
+             pargs->orig_cmd->proc != execCommand)) {
         cmd = pargs->orig_cmd;
         argc = pargs->orig_argc;
         argv = pargs->orig_argv;
@@ -99,7 +94,7 @@ void propagateArgsPrepareToFeed(propagateArgs *pargs) {
         gtid_repr = sdsnewlen(buf, buflen);
         zfree(buf);
 
-        cmd = server.gtidCommand;
+        cmd = gtidLookupCommandBySds("gtid");
         argc = pargs->orig_argc+3;
         argv = zmalloc(argc*sizeof(robj*));
         argv[0] = shared.gtid;
@@ -354,16 +349,6 @@ void ctrip_createReplicationBacklog(void) {
     server.gtid_seq = gtidSeqCreate();
 }
 
-void ctrip_resizeReplicationBacklog(long long newsize) {
-    long long oldsize = server.repl_backlog_size;
-    resizeReplicationBacklog(newsize);
-    if (server.repl_backlog != NULL && oldsize != server.repl_backlog_size) {
-        /* realloc a new gtidSeq to keep gtid_seq sync with backlog, see
-         * resizeReplicationBacklog for more details. */
-        gtidSeqDestroy(server.gtid_seq);
-        server.gtid_seq = gtidSeqCreate();
-    }
-}
 
 void ctrip_freeReplicationBacklog(void) {
     freeReplicationBacklog();
@@ -377,11 +362,9 @@ void ctrip_freeReplicationBacklog(void) {
 void ctrip_resetReplicationBacklog(void) {
     /* See resizeReplicationBacklog for more details */
     if (server.repl_backlog != NULL) {
-        zfree(server.repl_backlog);
-        server.repl_backlog = zmalloc(server.repl_backlog_size);
-        server.repl_backlog_histlen = 0;
-        server.repl_backlog_idx = 0;
-        server.repl_backlog_off = server.master_repl_offset+1;
+        gtidFreeReplicationBacklog();
+        gtidCreateReplicationBacklog();
+        
     }
     /* gtid_seq became invalid if master offset bumped. */
     if (server.gtid_seq != NULL) {
@@ -399,16 +382,10 @@ void ctrip_replicationFeedSlaves(list *slaves, int dictid, robj **argv,
 #endif
     if (touch_index) gtidSeqAppend(server.gtid_seq,uuid,uuid_len,gno,offset);
     replicationFeedSlaves(slaves,dictid,argv,argc);
-    if (touch_index) gtidSeqTrim(server.gtid_seq,server.repl_backlog_off);
+    if (touch_index) gtidSeqTrim(server.gtid_seq,gtidGetBacklogOffset());
 }
 
-void ctrip_replicationFeedSlavesFromMasterStream(list *slaves, char *buf,
-        size_t buflen, const char *uuid, size_t uuid_len, gno_t gno, long long offset) {
-    int touch_index = uuid != NULL && gno >= GTID_GNO_INITIAL && server.gtid_seq;
-    if (touch_index) gtidSeqAppend(server.gtid_seq,uuid,uuid_len,gno,offset);
-    replicationFeedSlavesFromMasterStream(slaves,buf,buflen);
-    if (touch_index) gtidSeqTrim(server.gtid_seq,server.repl_backlog_off);
-}
+
 
 void gtidInitialInfoInit(gtidInitialInfo *info) {
     info->gtid_lost = NULL;

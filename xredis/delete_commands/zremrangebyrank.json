@@ -1,0 +1,4 @@
+{
+  "name": "zremrangebyrank",
+  "parse": "cmdParseZremrangebyrank"
+}

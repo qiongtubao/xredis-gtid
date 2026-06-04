@@ -1,6 +1,6 @@
 
 #include "server.h"
-
+#include "xredis_gtid_adaptation_version.h"
 static void uuidSetFreeWrapper(void *ptr) {
     uuidSet *us = (uuidSet*)ptr;
     if (us) {
@@ -24,7 +24,7 @@ static dictType gtidGaplogDictType = {
 };
 gtidGaplog* gtidGaplogNew() {
     gtidGaplog* gaplog =  zmalloc(sizeof(gtidGaplog));
-    gaplog->data = dictCreate(&gtidGaplogDictType, NULL);
+    gaplog->data = gtidDictCreate(&gtidGaplogDictType);
     gaplog->size = 0;
     gaplog->history = listCreate();
     listSetFreeMethod(gaplog->history, uuidSetFreeWrapper);
@@ -267,8 +267,7 @@ void addReplyGtidGaplogKeys(client* c, gtidGaplogKeys* keys) {
         gtidGaplogKey *k = keys->keys[i];
         addReplyArrayLen(c, 4);
         addReplyBulkLongLong(c, k->dbid);
-        robj o = { .type = k->key_type };
-        addReplyBulkCString(c, getObjectTypeName(&o));
+        addReplyBulkCString(c, gtidGetObjectTypeName(k->key_type));
         addReplyBulkCBuffer(c, k->key, sdslen(k->key));
         addReplyArrayLen(c, k->subkeys_count);
         for (int j = 0; j < k->subkeys_count; j++) {

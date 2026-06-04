@@ -1,0 +1,4 @@
+{
+  "name": "zrevrange",
+  "parse": "cmdParseZrevrange"
+}
