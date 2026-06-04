@@ -133,3 +133,41 @@ skiplistNode* findFirstGteSkipList(skiplist *sl, long long target) {
     }
     return x->level[0].forward;
 }
+
+int skiplistInitIterator(skiplistIterator *it, skiplist *sl) {
+    it->sl = sl;
+    it->next = sl->header->level[0].forward;
+    it->reverse = 0;
+    return 0;
+}
+
+int skiplistReverseInitIterator(skiplistIterator *it, skiplist *sl) {
+    it->sl = sl;
+    it->next = sl->tail;
+    it->reverse = 1;
+    return 0;
+}
+
+void skiplistDeinitIterator(skiplistIterator *it) {
+    /* No heap allocations; nothing to release. The sl pointer is owned by
+     * the caller. Kept for API symmetry with the other iterators in
+     * this codebase. */
+    (void)it;
+}
+
+skiplistNode *skiplistIteratorNext(skiplistIterator *it) {
+    skiplistNode *curr = it->next;
+    if (curr == NULL) return NULL;
+    it->next = it->reverse ? curr->backward : curr->level[0].forward;
+    return curr;
+}
+
+int skiplistIteratorSeek(skiplistIterator *it, long long target) {
+    skiplistNode *node = findFirstGteSkipList(it->sl, target);
+    if (node == NULL) {
+        it->next = NULL;
+        return 0;
+    }
+    it->next = node;
+    return 1;
+}

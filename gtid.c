@@ -373,6 +373,24 @@ int gtidIntervalSkipListContains(gtidIntervalSkipList *gsl, gno_t gno) {
     return x->start <= gno && gno <= x->end;
 }
 
+/* Seek-style find: return the interval node containing `gno`, or the
+ * first interval node whose start is greater than `gno` if no interval
+ * contains it. Returns NULL if `gno` is past the last interval or the
+ * list is empty. */
+gtidIntervalNode* gtidIntervalSkipListFindFirstGte(gtidIntervalSkipList *gsl,
+        gno_t gno) {
+    int i;
+    gtidIntervalNode *x = gsl->header;
+    assert(gno >= GTID_GNO_INITIAL);
+    for (i = gsl->level-1; i >= 0; i--) {
+        while (x->forwards[i] && x->forwards[i]->start <= gno)
+            x = x->forwards[i];
+    }
+    if (x != gsl->header && gno <= x->end)
+        return x;
+    return x->forwards[0];
+}
+
 gno_t gtidIntervalSkipListNext(gtidIntervalSkipList *gsl, int update) {
     gno_t gno = gsl->tail->end+1;
     if (update) gtidIntervalSkipListAdd(gsl, gno, gno);
@@ -565,6 +583,7 @@ gno_t uuidSetNext(uuidSet* uuid_set, int update) {
 
 
 int uuidSetInitIterator(uuidSetIterator* iterator, uuidSet* uuid_set) {
+    iterator->uuid_set = uuid_set;
     iterator->next = uuid_set->intervals->header->forwards[0];
     return 1;
 }
@@ -576,6 +595,12 @@ gtidIntervalNode* uuidSetIteratorNext(uuidSetIterator* iterator) {
     gtidIntervalNode* node = iterator->next;
     iterator->next = node->forwards[0];
     return node;
+}
+int uuidSetIteratorSeek(uuidSetIterator* iterator, gno_t gno) {
+    if (iterator->uuid_set == NULL) return 0;
+    iterator->next = gtidIntervalSkipListFindFirstGte(
+            iterator->uuid_set->intervals, gno);
+    return iterator->next != NULL;
 }
 
 gtidSet* gtidSetNew() {
@@ -857,6 +882,7 @@ int gtidSetRelated(gtidSet *set1, gtidSet *set2) {
 
 /*gtidSet iterator*/
 int gtidSetInitIterator(gtidSetIterator* iterator, gtidSet* gtid_set) {
+    iterator->gtid_set = gtid_set;
     iterator->next = gtid_set->header;;
     return 1;
 }
@@ -868,6 +894,25 @@ uuidSet* gtidSetIteratorNext(gtidSetIterator* iterator) {
     uuidSet* cur = iterator->next;
     iterator->next = cur->next;
     return cur;
+}
+int gtidSetIteratorSeek(gtidSetIterator* iterator, const char* uuid,
+        size_t uuid_len) {
+    if (iterator->gtid_set == NULL) return 0;
+    uuidSet *cur = iterator->gtid_set->header;
+    if (uuid == NULL) {
+        iterator->next = cur;
+        return cur != NULL;
+    }
+    while (cur) {
+        if (cur->uuid_len == uuid_len &&
+                memcmp(cur->uuid, uuid, uuid_len) == 0) {
+            iterator->next = cur;
+            return 1;
+        }
+        cur = cur->next;
+    }
+    iterator->next = NULL;
+    return 0;
 }
 
 void uuidSetGetStat(uuidSet *uuid_set, gtidStat *stat) {

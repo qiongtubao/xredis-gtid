@@ -61,6 +61,7 @@ typedef struct uuidSet {
 } uuidSet;
 
 typedef struct uuidSetIterator {
+    uuidSet *uuid_set;
     gtidIntervalNode *next;
 } uuidSetIterator;
 
@@ -76,6 +77,7 @@ typedef struct gtidSet {
 } gtidSet;
 
 typedef struct gtidSetIterator {
+    gtidSet *gtid_set;
     uuidSet *next;
 } gtidSetIterator;
 
@@ -108,6 +110,7 @@ void uuidSetGetStat(uuidSet *uuid_set, gtidStat *stat);
 int uuidSetInitIterator(uuidSetIterator* iterator, uuidSet* gtid_set);
 void uuidSetDeinitIterator(uuidSetIterator* iterator);
 gtidIntervalNode* uuidSetIteratorNext(uuidSetIterator* iterator);
+int uuidSetIteratorSeek(uuidSetIterator* iterator, gno_t gno);
 
 gtidSet* gtidSetNew();
 void gtidSetFree(gtidSet* gtid_set);
@@ -129,6 +132,7 @@ int gtidSetRelated(gtidSet *set1, gtidSet *set2);
 int gtidSetInitIterator(gtidSetIterator* iterator, gtidSet* gtid_set);
 void gtidSetDeinitIterator(gtidSetIterator* iterator);
 uuidSet* gtidSetIteratorNext(gtidSetIterator* iterator);
+int gtidSetIteratorSeek(gtidSetIterator* iterator, const char* uuid, size_t uuid_len);
 
 
 /* Cache current uuid set to skip uuid compare. Note that it would crash
@@ -228,13 +232,13 @@ typedef struct skipType {
 } skipType;
 
 typedef struct skiplist {
-    skiplistNode *header; 
-    skiplistNode *tail;  
-    unsigned long length;      
-    int level;                 
+    skiplistNode *header;
+    skiplistNode *tail;
+    unsigned long length;
+    int level;
     skipType* type;
 } skiplist;
-struct 
+struct
 skiplist* createSkipList(skipType* type);
 void freeSkipList(skiplist *sl);
 int tryInsertSkipList(skiplist *sl, long long score, void *value, int score_unique);
@@ -243,5 +247,36 @@ int deleteSkipList(skiplist *sl, long long score);
 skiplistNode* firstSkipList(skiplist *sl);
 
 skiplistNode* findFirstGteSkipList(skiplist *sl, long long target);
+
+typedef struct skiplistIterator {
+    skiplist *sl;
+    skiplistNode *next;
+    int reverse;
+} skiplistIterator;
+
+/* Initialize an iterator for forward traversal (smallest score first).
+ * Returns 0 on success. */
+int skiplistInitIterator(skiplistIterator *it, skiplist *sl);
+
+/* Initialize an iterator for reverse traversal (largest score first).
+ * Returns 0 on success. */
+int skiplistReverseInitIterator(skiplistIterator *it, skiplist *sl);
+
+/* Release any resources held by the iterator. Currently a no-op, kept
+ * for API symmetry. */
+void skiplistDeinitIterator(skiplistIterator *it);
+
+/* Return the current node and advance the iterator. Returns NULL once
+ * the iterator is past the end (or past the start, for reverse). */
+skiplistNode *skiplistIteratorNext(skiplistIterator *it);
+
+/* Reposition the iterator to the first node with score >= target.
+ * Returns 1 if such a node exists, 0 otherwise (in which case the
+ * iterator will yield NULL on subsequent Next calls).
+ *
+ * Note: for a reverse iterator, "target" still refers to the score
+ * ordering, not the iteration direction.
+ */
+int skiplistIteratorSeek(skiplistIterator *it, long long target);
 
 #endif  /* __REDIS_CTRIP_GTID_H */
