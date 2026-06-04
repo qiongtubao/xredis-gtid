@@ -631,7 +631,7 @@ void gtidxCommand(client *c) {
             skiplist *sl = dictGetVal(de);
 
             gtidGapLogDataIterator iter;
-            gtidGapLogInitDataIterator(&iter, sl, start_gno);
+            gtidGapLogDataInitIterator(&iter, sl, start_gno);
 
             long long count = 0;
             void *arraylen = addReplyDeferredLen(c); 
@@ -659,7 +659,7 @@ void gtidxCommand(client *c) {
             if (de != NULL) {
                 skiplist *sl = dictGetVal(de);
                 gtidGapLogDataIterator iter;
-                gtidGapLogInitDataIterator(&iter, sl, start_gno);
+                gtidGapLogDataInitIterator(&iter, sl, start_gno);
                 gno_t gno;
                 while ((gno = gtidGapLogDataGetGno(&iter)) != -1 && gno <= end_gno) {
                     gtidGapLogDataNext(&iter);
@@ -736,11 +736,11 @@ void gtidxCommand(client *c) {
                     serverAssert(de != NULL);
                     sl = dictGetVal(de);
                     gtidGapLogDeinitDataIterator(&data_iter);
-                    gtidGapLogInitDataIterator(&data_iter, sl, gno);
+                    gtidGapLogDataInitIterator(&data_iter, sl, gno);
                     last_uuid = uuid;
                 } else if (gtidGapLogDataGetGno(&data_iter) != gno) {
                     gtidGapLogDeinitDataIterator(&data_iter);
-                    gtidGapLogInitDataIterator(&data_iter, sl, gno);
+                    gtidGapLogDataInitIterator(&data_iter, sl, gno);
                 }
 
                 serverAssert(gtidGapLogDataGetGno(&data_iter) == gno);

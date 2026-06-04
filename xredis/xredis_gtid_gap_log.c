@@ -118,24 +118,29 @@ gtidGapLogKeys* buildGtidGapLogKeys(gtidGapLogKeysBuilder* builder) {
 }
 
 /* ========== gtidGapLog Data iterator ========== */
-void gtidGapLogInitDataIterator(gtidGapLogDataIterator *iter, skiplist *sl, gno_t start_gno) {
-    iter->node = findFirstGteSkipList(sl, start_gno);
+void gtidGapLogDataInitIterator(gtidGapLogDataIterator *iter, skiplist *sl, gno_t start_gno) {
+    skiplistInitIterator(&iter->sl_iter, sl);
+    skiplistIteratorSeek(&iter->sl_iter, start_gno);
 }
 
 void gtidGapLogDeinitDataIterator(gtidGapLogDataIterator *iter) {
-    UNUSED(iter);
+    skiplistDeinitIterator(&iter->sl_iter);
+}
+
+void gtidGapLogDataIteratorSeek(gtidGapLogDataIterator *iter, gno_t gno) {
+    skiplistIteratorSeek(&iter->sl_iter, gno);
 }
 
 gno_t gtidGapLogDataGetGno(gtidGapLogDataIterator* iter) {
-    if (iter->node == NULL) return -1;
-    return (gno_t)iter->node->score;
+    skiplistNode *node = iter->sl_iter.next;
+    if (node == NULL) return -1;
+    return (gno_t)node->score;
 }
 
 gtidGapLogKeys* gtidGapLogDataNext(gtidGapLogDataIterator* iter) {
-    if (iter->node == NULL) return NULL;
-    gtidGapLogKeys* keys = (gtidGapLogKeys*)iter->node->value;
-    iter->node = iter->node->level[0].forward;
-    return keys;
+    skiplistNode *node = skiplistIteratorNext(&iter->sl_iter);
+    if (node == NULL) return NULL;
+    return (gtidGapLogKeys*)node->value;
 }
 
 /* ========== gtidGapLog History iterator ========== */
@@ -221,6 +226,38 @@ gno_t gtidGapLogHistoryNext(gtidGapLogHistoryIterator* iter,
 
 void gtidGapLogDeinitHistoryIterator(gtidGapLogHistoryIterator* iter) {
     UNUSED(iter);
+}
+
+/* Reposition the history iterator so the next call to
+ * gtidGapLogHistoryNext returns a gno >= `gno`. If `gno` falls inside the
+ * current uuidSet's interval range, seek within it. Otherwise advance to
+ * the first entry of the next uuidSet (if any). If the iterator is past
+ * the end, leave it in the exhausted state. */
+void gtidGapLogHistoryIteratorSeek(gtidGapLogHistoryIterator* iter, gno_t gno) {
+    if (iter->list_node == NULL) return;
+
+    uuidSet *us = listNodeValue(iter->list_node);
+    uuidSetIterator us_iter;
+    uuidSetInitIterator(&us_iter, us);
+
+    if (uuidSetIteratorSeek(&us_iter, gno) == 0) {
+        /* gno is past this uuidSet's range: jump to next uuidSet */
+        iter->list_node = listNextNode(iter->list_node);
+        iter->interval_node = NULL;
+        iter->next_gno = 0;
+        if (iter->list_node) {
+            us = listNodeValue(iter->list_node);
+            iter->interval_node = us->intervals->header->forwards[0];
+            if (iter->interval_node)
+                iter->next_gno = iter->interval_node->start;
+        }
+        uuidSetDeinitIterator(&us_iter);
+        return;
+    }
+
+    iter->interval_node = us_iter.next;
+    iter->next_gno = gno;
+    uuidSetDeinitIterator(&us_iter);
 }
 
 
