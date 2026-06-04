@@ -1,5 +1,5 @@
-#ifndef XREDIS_CMDPARSE_H
-#define XREDIS_CMDPARSE_H
+#ifndef XREDIS_GTID_CMDPARSE_H
+#define XREDIS_GTID_CMDPARSE_H
 
 typedef struct redisObject robj;
 
@@ -59,7 +59,7 @@ int cmdParseCountKeys(struct redisCommand *cmd, robj **argv, int argc);
 
 void cmdParseKeys(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key);
 
-void cmdParseBindToCommands(void);
+
 
 int (*cmdParseGetCountFunc(const char *cmd_name))(robj **argv, int argc);
 

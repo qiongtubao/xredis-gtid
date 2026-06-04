@@ -1,4 +1,5 @@
-#include "xredis_cmdparse.h"
+#include "xredis_gtid_cmdparse.h"
+#include "xredis_gtid_adaptation_version.h"
 #include "server.h"
 
 
@@ -66,7 +67,7 @@ static void cmdParseGeoAdd(int dbid, struct redisCommand *cmd, robj **argv, int 
         }
     }
     int subkeys_count = (argc - i) / 3;  /* lon/lat/member  */
-    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, i + 2, 3, NULL, NULL); /* member 从 i+2 开始 */
+    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, i + 2, 3, NULL, NULL); /* member starts at argv[i+2] */
 }
 
 /* geodist：key + member1 + member2（ 2  subkey） */
@@ -82,46 +83,42 @@ static void cmdParseGeoDist(int dbid, struct redisCommand *cmd, robj **argv, int
 
 #include "xredis_commands.def"
 
+dictType cmd_parse_command_dict_type = {
+    dictSdsHash,
+    NULL,
+    NULL,
+    dictSdsKeyCompare,
+    dictSdsDestructor,
+    NULL,
+};
 
-void cmdParseKeys(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
-    if (argc < 1) return;
-    if (cmd == NULL) {
-        cmd = lookupCommand(argv[0]->ptr);
+dict* createCmdParseCommandDict() {
+    dict* cmd_parse_command_dict = gtidDictCreate(&cmd_parse_command_dict_type);
+    for (int i = 0; cmd_parse_commands[i].name != NULL; i++) {
+        dictAdd(cmd_parse_command_dict, sdsnew(cmd_parse_commands[i].name), &cmd_parse_commands[i]);
     }
-    serverAssert(cmd != NULL);
-
-    if (cmd->cmdparse_parse != NULL) {
-        cmd->cmdparse_parse(dbid, cmd, argv, argc, ctx, on_key);
+    return cmd_parse_command_dict;
+}
+void cmdParseKeys(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
+    static dict* cmd_parse_command_dict = NULL;
+    if (cmd_parse_command_dict == NULL) {
+        cmd_parse_command_dict = createCmdParseCommandDict();
+    }
+    if (argc < 1) return;
+    cmdParseCommandDef* parsecmd = dictFetchValue(cmd_parse_command_dict,argv[0]->ptr);
+    if (parsecmd != NULL) {
+        parsecmd->parse(dbid, cmd, argv, argc, ctx, on_key);
         return;
     }
-    
+    if (cmd == NULL) cmd = gtidLookupCommandBySds(argv[0]->ptr);
+    serverAssert(cmd != NULL);
     getKeysResult keys = GETKEYS_RESULT_INIT;
     int numkeys = getKeysFromCommand(cmd, argv, argc, &keys);
     for (int i = 0; i < numkeys; i++) {
-        on_key(ctx, dbid, cmd, argv, argc, keys.keys[i], 0, 0, 0, NULL, NULL);
+        on_key(ctx, dbid, cmd, argv, argc, gtidGetKeysResultKeyIndex(&keys, i), 0, 0, 0, NULL, NULL);
     }
     getKeysFreeResult(&keys);
     return;
 }
 
-void cmdParseBindToCommands(void) {
-    int i;
-    for (i = 0; cmd_parse_commands[i].name != NULL; i++) {
-        sds name = sdsnew(cmd_parse_commands[i].name);
-        struct redisCommand *cmd = lookupCommand(name);
-        sdsfree(name);
-        if (cmd != NULL) {
-            cmd->cmdparse_parse = cmd_parse_commands[i].parse;
-        }
-    }
-}
 
-
-void (*cmdParseGetParseFunc(const char *cmd_name))(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
-    if (cmd_name == NULL) return NULL;
-    struct redisCommand *cmd = lookupCommandByCString(cmd_name);
-    if (cmd != NULL) {
-        return cmd->cmdparse_parse;
-    }
-    return NULL;
-}

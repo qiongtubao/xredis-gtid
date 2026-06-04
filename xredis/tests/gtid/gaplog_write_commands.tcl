@@ -1,10 +1,4 @@
 
-proc get_info_property {r section line property} {
-    set str [$r info $section]
-    if {[regexp ".*${line}:\[^\r\n\]*${property}=(\[^,\r\n\]*).*" $str match submatch]} {
-        set _ $submatch
-    }
-}
 
 start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
     start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
@@ -595,6 +589,192 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             assert_match "*s_mkey1*" $result
             assert_match "*s_mkey2*" $result
             assert_match "*s_mkey3*" $result
+        }
+    }
+}
+
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-WRITE-012: 300 SET xcontinue" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 300} {incr i} { $S set "mk_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            assert_equal [gaploglen $S] 300; assert_equal [$S get mk_1] v1; assert_equal [$S get mk_300] v300
+            assert_equal [$S get m_b] m_v
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-WRITE-013: SET 3 dbs" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            $S select 0
+            for {set i 1} {$i <= 5} {incr i} { $S set "d0_${i}" "v${i}" }
+            $S select 1
+            for {set i 1} {$i <= 5} {incr i} { $S set "d1_${i}" "v${i}" }
+            $S select 2
+            for {set i 1} {$i <= 5} {incr i} { $S set "d2_${i}" "v${i}" }
+            replicaof_xcontinue $S $Mh $Mp
+            assert_equal [gaploglen $S] 15
+            set d {}
+            for {set i 0} {$i < 15} {incr i} {
+                set e [lindex [$S GTIDX GAPLOG LIST $i 1] 0]
+                foreach k [lindex $e 2] { lappend d [lindex $k 0] }
+            }
+            assert_equal [llength $d] 15
+            assert_equal [llength [lsearch -all -integer $d 0]] 5
+            assert_equal [llength [lsearch -all -integer $d 1]] 5
+            assert_equal [llength [lsearch -all -integer $d 2]] 5
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 200}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 200}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-CAPACITY-001: trim at maxgap=200" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 150} {incr i} { $S set "c1_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            assert_equal [gaploglen $S] 150
+            assert {[llength [$S GTIDX GAPLOG RANGE $su 1 50]] > 0}
+        }
+    }
+}
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 50}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 50}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-CAPACITY-002: trim+LIST" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 100} {incr i} { $S set "c2_${i}" "v${i}" }
+            set su [get_uuid $S]
+            $S replicaof $Mh $Mp; wait_for_sync $S; after 500
+            set gl [gaploglen $S]; assert {$gl <= 50}
+            set pg -1
+            for {set i 0} {$i < $gl} {incr i} {
+                set g [lindex [lindex [$S GTIDX GAPLOG LIST $i 1] 0] 1]
+                assert {$g > $pg}; set pg $g
+            }
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-WRITE-014: MSETNX conflict" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            assert_equal [$S msetnx nx1 v1 nx2 v2 nx3 v3] 1
+            assert_equal [$S msetnx nx1 cx nx4 v4 nx5 v5] 0
+            assert_equal [$S get nx1] v1; assert_equal [$S exists nx4] 0
+            replicaof_xcontinue $S $Mh $Mp
+            assert {[gaploglen $S] >= 1 && [gaploglen $S] <= 2}
+            assert_equal [$S get nx1] v1; assert_equal [$S exists nx4] 0
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-WRITE-015: EVAL multi-key" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            $S set ew 0
+            set lua {
+                redis.call("MSET",KEYS[1],ARGV[1],KEYS[2],ARGV[2],KEYS[3],ARGV[3])
+                redis.call("DEL",KEYS[4]);redis.call("SET",KEYS[5],ARGV[5])
+                return "OK"
+            }
+            $S EVAL $lua 5 k1 k2 k3 ew k5 aa bb cc dd ee
+            replicaof_xcontinue $S $Mh $Mp
+            assert {[gaploglen $S] >= 1}
+            assert_equal [$S get k1] aa; assert_equal [$S get k5] ee
+            assert_equal [$S exists ew] 0
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 200}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 200}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-LIST-010: LIST count=100" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 150} {incr i} { $S set "lb_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            assert_equal [llength [$S GTIDX GAPLOG LIST 0 100]] 100
+            catch {$S GTIDX GAPLOG LIST 0 101} e; assert_match "*count must*" $e
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-LIST-011: LIST start=size empty" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 5} {incr i} { $S set "le_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            set l [gaploglen $S]
+            assert_equal [$S GTIDX GAPLOG LIST $l 10] {}
+            assert_equal [$S GTIDX GAPLOG LIST [expr {$l+100}] 10] {}
+            assert_equal [llength [$S GTIDX GAPLOG LIST [expr {$l-1}] 1]] 1
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-KEY-001: special keys" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            set lk "sl_[string repeat x 1000]"
+            $S set $lk vl; $S hset eh "" ev
+            set bk "sb_\x00\xff\x01\xfe"
+            $S set $bk vb
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            assert {[gaploglen $S] >= 3}
+            set rs [join [$S GTIDX GAPLOG LIST 0 3] " "]
+            assert_match "*sl_xxxxxxxxxx*" $rs; assert_match "*sb_*" $rs; assert_match "*eh*" $rs
+            assert_equal [$S get $lk] vl; assert_equal [$S get $bk] vb
+            assert_equal [$S hget eh ""] ev
+        }
+    }
+}
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-KEY-002: oversized values" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            set bv [string repeat "x" 10240]
+            for {set i 1} {$i <= 100} {incr i} { $S set "bv_${i}" $bv }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            assert_equal [gaploglen $S] 100
+            assert_equal [string length [$S get bv_1]] 10240
+            assert_equal [string length [$S get bv_100]] 10240
         }
     }
 }

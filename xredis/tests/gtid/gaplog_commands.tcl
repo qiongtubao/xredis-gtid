@@ -1,4 +1,6 @@
 
+
+
 start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes}} {
     test "GAPLOG-CMD-001: GAPLOG LEN - empty gaplog returns 0" {
         set len [r GTIDX GAPLOG LEN]
@@ -299,6 +301,72 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
                     assert_equal [lindex $second_before 1] [lindex $first_after 1]
                 }
             }
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-CMD-016: DEL+DELETERANGE partial" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 10} {incr i} { $S set "t_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            set mg [lindex [lindex [$S GTIDX GAPLOG LIST 0 1] 0] 1]
+            assert_equal [$S GTIDX GAPLOG DELETERANGE $su [expr {$mg+1}] [expr {$mg+1}]] 1
+            assert_equal [$S GTIDX GAPLOG DELETERANGE $su [expr {$mg+3}] [expr {$mg+3}]] 1
+            assert_equal [llength [$S GTIDX GAPLOG RANGE $su $mg [expr {$mg+4}]]] 6
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-CMD-015: RANGE start=end" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            $S set p1 v1; $S set p2 v2; $S set p3 v3
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            set mg [lindex [lindex [$S GTIDX GAPLOG LIST 0 1] 0] 1]
+            set r [$S GTIDX GAPLOG RANGE $su $mg $mg]
+            assert {[llength $r] == 2}; assert_equal [lindex $r 0] $mg
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-DEL-001: non-contiguous" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 5} {incr i} { $S set "d_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            set gl [gaploglen $S]; assert {$gl >= 5}
+            set mg [lindex [lindex [$S GTIDX GAPLOG LIST 0 1] 0] 1]
+            assert_equal [$S GTIDX GAPLOG DELETERANGE $su $mg $mg] 1
+            assert_equal [$S GTIDX GAPLOG DELETERANGE $su [expr {$mg+2}] [expr {$mg+2}]] 1
+            assert_equal [gaploglen $S] [expr {$gl-2}]
+        }
+    }
+}
+
+start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+    start_server {overrides {gtid-enabled yes gtid-gaplog-enabled yes gtid-xsync-max-gap 10000}} {
+        set M [srv -1 client]; set Mh [srv -1 host]; set Mp [srv -1 port]; set S [srv 0 client]
+        test "GAPLOG-DEL-002: uuid isolation" {
+            $S replicaof $Mh $Mp; wait_for_sync $S
+            $M set m_b m_v; wait_for_sync $S
+            $S replicaof no one; after 100
+            for {set i 1} {$i <= 5} {incr i} { $S set "iso_${i}" "v${i}" }
+            set su [get_uuid $S]; replicaof_xcontinue $S $Mh $Mp
+            set mg [lindex [lindex [$S GTIDX GAPLOG LIST 0 1] 0] 1]
+            assert_equal [$S GTIDX GAPLOG DELETERANGE "NO_UUID" $mg [expr {$mg+4}]] 0
         }
     }
 }
