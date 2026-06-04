@@ -1,0 +1,5 @@
+{
+  "name": "zunion",
+  "count": "cmdCountZunion",
+  "parse": "cmdParseZunion"
+}

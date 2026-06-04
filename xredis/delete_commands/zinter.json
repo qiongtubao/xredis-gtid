@@ -1,0 +1,5 @@
+{
+  "name": "zinter",
+  "count": "cmdCountZunion",
+  "parse": "cmdParseZunion"
+}

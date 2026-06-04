@@ -1,0 +1,5 @@
+{
+  "name": "touch",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}

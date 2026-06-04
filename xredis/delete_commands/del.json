@@ -1,0 +1,5 @@
+{
+  "name": "del",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}

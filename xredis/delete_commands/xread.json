@@ -1,0 +1,5 @@
+{
+  "name": "xread",
+  "count": "cmdCountXread",
+  "parse": "cmdParseXread"
+}

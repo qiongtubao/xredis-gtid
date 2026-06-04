@@ -1,0 +1,4 @@
+{
+  "name": "zrange",
+  "parse": "cmdParseSingleKey"
+}

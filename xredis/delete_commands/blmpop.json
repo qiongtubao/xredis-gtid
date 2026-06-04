@@ -1,0 +1,5 @@
+{
+  "name": "blmpop",
+  "count": "cmdCountBlmpop",
+  "parse": "cmdParseBlmpop"
+}

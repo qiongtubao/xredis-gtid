@@ -1,0 +1,5 @@
+{
+  "name": "sdiff",
+  "count": "cmdCountDel",
+  "parse": "cmdParseDel"
+}
