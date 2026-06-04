@@ -30,16 +30,17 @@ ssize_t backlogAppendToSds(long long offset, sds *dst, size_t size) {
         total += thislen;
         j = 0;
     }
-    sdsIncrLen(*dst, (int)total);
+    sdsIncrLen(*dst, total);
+
     return (ssize_t)total;
 }
 
 
-static void gtidGapLogKeysBuilderAdd(gtidGapLogKeysBuilder *builder, int dbid, int type, sds key,
+static void gtidGaplogKeysBuilderAdd(gtidGaplogKeysBuilder *builder, int dbid, int type, sds key,
                        sds *subkeys, int subkeys_count)
 {
-    gtidGapLogKeysPrepareBuilder(builder, 1);
-    gtidGapLogKey *key_result = gtidGapLogKeyNew(dbid, type, key, subkeys, subkeys_count);
+    gtidGaplogKeysPrepareBuilder(builder, 1);
+    gtidGaplogKey *key_result = gtidGaplogKeyNew(dbid, type, key, subkeys, subkeys_count);
     builder->keys_infos[builder->numkeys++] = key_result;
 }
 
@@ -53,25 +54,55 @@ int cmdGetKeyType(struct redisCommand *cmd) {
     if (cmd->flags & CMD_CATEGORY_BITMAP) return OBJ_STRING;
     return OBJ_UNKNOWN;
 }
-static void gtidOnKey(void *ctx, int dbid, struct redisComamnd* cmd, robj** argv, int argc,  int key_arg_idx,
+static void gtidOnKey(void *ctx, int dbid, struct redisCommand* cmd, robj** argv, int argc,  int key_arg_idx,
                       int subkeys_count, int subkeys_start,
                       int subkeys_step, const int *subkey_arg_idxs,
                       const cmdParseKeyExtra *extra)
 {
     UNUSED(extra);
     UNUSED(argc);
-    gtidGapLogKeysBuilder *builder = ctx;
+    gtidGaplogKeysBuilder *builder = ctx;
     sds key = sdsdup((sds)argv[key_arg_idx]->ptr);
     sds *subkeys = subkeys_count > 0 ? zmalloc(sizeof(sds) * subkeys_count) : NULL;
     for (int i = 0; i < subkeys_count; i++) {
         int subkey_idx = subkey_arg_idxs ? subkey_arg_idxs[i] : (subkeys_start + i * subkeys_step);
         subkeys[i] = sdsdup((sds)argv[subkey_idx]->ptr);
     }
-    gtidGapLogKeysBuilderAdd(builder, dbid, cmdGetKeyType(cmd), key, subkeys, subkeys_count);
+    gtidGaplogKeysBuilderAdd(builder, dbid, cmdGetKeyType(cmd), key, subkeys, subkeys_count);
 }
 
-void gtidGapLogKeysBuilderAddFromCmd(gtidGapLogKeysBuilder *builder, int dbid, robj **args, int argc) {
+void gtidGaplogKeysBuilderAddFromCmd(gtidGaplogKeysBuilder *builder, int dbid, robj **args, int argc) {
     if (argc < 2) return;
     serverAssert( builder != NULL);
     cmdParseKeys(dbid, NULL, args, argc, builder, gtidOnKey);
 }
+
+
+void mockClientInit(client* mock) {
+    mock->querybuf = sdsempty();
+    mock->authenticated = 1;
+    mock->argv = NULL;
+    mock->argc = 0;
+    mock->qb_pos = 0;
+    mock->flags = 0;
+    mock->bulklen =- 1;
+    mock->multibulklen = 0;
+}
+
+void mockClientCleanArgv(client* mock) {
+    if (mock->argv) {
+        for (int i = 0; i < mock->argc; i++)
+            if (mock->argv[i]) decrRefCount(mock->argv[i]);
+        zfree(mock->argv);
+        mock->argv = NULL;
+        mock->argc = 0;
+    }
+}
+
+void mockClientDeinit(client* mock) {
+    mockClientCleanArgv(mock);
+    sdsfree(mock->querybuf);
+    mock->querybuf = NULL;
+    mock->qb_pos = 0;
+}
+

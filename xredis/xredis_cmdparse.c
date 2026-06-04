@@ -66,7 +66,7 @@ static void cmdParseGeoAdd(int dbid, struct redisCommand *cmd, robj **argv, int 
         }
     }
     int subkeys_count = (argc - i) / 3;  /* lon/lat/member  */
-    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, i + 2, 3, NULL, NULL); /* member 从 i+2 开始 */
+    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, i + 2, 3, NULL, NULL); /* member starts at argv[i+2] */
 }
 
 /* geodist：key + member1 + member2（ 2  subkey） */

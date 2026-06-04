@@ -1247,8 +1247,7 @@ start_server {tags {"xsync"} overrides {gtid-enabled yes}} {
             # assert_equal [status $M sync_partial_ok] [expr $orig_sync_partial_ok_M+$i]
             assert_equal [status $S sync_full] $orig_sync_full_S
             # assert_equal [status $S sync_partial_ok]  [expr $orig_sync_partial_ok_S+2*$i]
-
-            # TODO 判断 数据一致
+                       
         }
     }
 }

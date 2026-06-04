@@ -238,14 +238,12 @@ typedef struct skiplist {
     skipType* type;
 } skiplist;
 struct
-skiplist* createSkipList(skipType* type);
-void freeSkipList(skiplist *sl);
-int tryInsertSkipList(skiplist *sl, long long score, void *value, int score_unique);
-
-int deleteSkipList(skiplist *sl, long long score);
-skiplistNode* firstSkipList(skiplist *sl);
-
-skiplistNode* findFirstGteSkipList(skiplist *sl, long long target);
+skiplist* skiplistCreate(skipType* type);
+void skiplistFree(skiplist *sl);
+int skiplistInsert(skiplist *sl, long long score, void *value, int score_unique);
+int skiplistDelete(skiplist *sl, long long score);
+skiplistNode* skiplistFirst(skiplist *sl);
+skiplistNode* skiplistFindFirstGte(skiplist *sl, long long target);
 
 typedef struct skiplistIterator {
     skiplist *sl;

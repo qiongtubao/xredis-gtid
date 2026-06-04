@@ -160,7 +160,7 @@ gtidIntervalSkipList *gtidIntervalSkipListDup(gtidIntervalSkipList *gsl) {
     return dup;
 }
 
-static int gitdIntervalRandomLevel(void) {
+static int gtidIntervalRandomLevel(void) {
     int level = 1;
     while ((rand()&0xFFFF) < (GTID_INTERVAL_SKIPLIST_P * 0xFFFF))
         level += 1;
@@ -204,7 +204,7 @@ gno_t gtidIntervalSkipListAdd(gtidIntervalSkipList *gsl, gno_t start, gno_t end)
 
     if (lefts[0] == rights[0]) {
         /* none overlaps with [start, end]: create new one. */
-        level = gitdIntervalRandomLevel();
+        level = gtidIntervalRandomLevel();
         x = gtidIntervalNodeNew(level,start,end);
 
        if (level > gsl->level) {
@@ -292,7 +292,7 @@ gno_t gtidIntervalSkipListRemove(gtidIntervalSkipList *gsl, gno_t start,
 
     if (rights[0]->end < lefts[0]->start) {
         /* remove gno within one node: split it. */
-        int level = gitdIntervalRandomLevel();
+        int level = gtidIntervalRandomLevel();
         x = gtidIntervalNodeNew(level,end+1,lefts[0]->end);
         lefts[0]->end = start-1;
 
@@ -883,7 +883,7 @@ int gtidSetRelated(gtidSet *set1, gtidSet *set2) {
 /*gtidSet iterator*/
 int gtidSetInitIterator(gtidSetIterator* iterator, gtidSet* gtid_set) {
     iterator->gtid_set = gtid_set;
-    iterator->next = gtid_set->header;;
+    iterator->next = gtid_set->header;
     return 1;
 }
 void gtidSetDeinitIterator(gtidSetIterator* iterator) {
