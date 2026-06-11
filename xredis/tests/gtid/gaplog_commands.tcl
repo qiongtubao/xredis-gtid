@@ -48,8 +48,8 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
     test "GAPLOG-CMD-005: GAPLOG RANGE - start > end returns empty" {
         r GTIDX GAPLOG CLEAR
-        set result [r GTIDX GAPLOG RANGE "uuid-001" 5 1]
-        assert_equal $result {}
+        catch {[r GTIDX GAPLOG RANGE "uuid-001" 5 1]} err
+        assert_match "ERR start gno must be <= end gno" $err
     }
 
     test "GAPLOG-CMD-006: GAPLOG RANGE - start beyond max gno returns empty" {
@@ -226,6 +226,46 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             }
         }
 
+        test "GAPLOG-LIST-006: LIST keys content - verify dbid/type/key/subkeys format" {
+            set list_result [$S GTIDX GAPLOG LIST 0 1]
+            set first_entry [lindex $list_result 0]
+            assert {[llength $first_entry] == 3}
+
+            set keys [lindex $first_entry 2]
+            assert {[llength $keys] > 0}
+
+            foreach key_entry $keys {
+                assert {[llength $key_entry] == 4}
+                set dbid [lindex $key_entry 0]
+                set ktype [lindex $key_entry 1]
+                set kname [lindex $key_entry 2]
+                set subkeys [lindex $key_entry 3]
+
+                assert {$dbid >= 0 && $dbid <= 15}
+
+                assert {[string length $ktype] > 0}
+
+                assert {[string length $kname] > 0}
+
+                assert {[string is list $subkeys]}
+            }
+        }
+
+        test "GAPLOG-LIST-007: LIST start_idx out of range returns empty array" {
+            set gaplog_len [$S GTIDX GAPLOG LEN]
+            set result [$S GTIDX GAPLOG LIST $gaplog_len 10]
+            assert_equal $result {}
+        }
+
+        test "GAPLOG-LIST-008: LIST count exceeds remaining entries - truncated" {
+            set gaplog_len [$S GTIDX GAPLOG LEN]
+            set start_idx [expr {$gaplog_len - 2}]
+            if {$start_idx < 0} { set start_idx 0 }
+            set result [$S GTIDX GAPLOG LIST $start_idx 100]
+            set expected [expr {$gaplog_len - $start_idx}]
+            assert {[llength $result] == $expected}
+        }
+
         test "GAPLOG DELETERANGE command - delete single entry" {
             # Get slave uuid
             set info [$S INFO gtid]
@@ -255,6 +295,31 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             # Verify length decreased after delete
             set new_len [$S GTIDX GAPLOG LEN]
             assert {$new_len == [expr {$gaplog_len - $deleted}]}
+        }
+
+        test "GAPLOG-LIST-009: LIST after DEL - verify deleted entry removed and order preserved" {
+            set gaplog_len [$S GTIDX GAPLOG LEN]
+            if {$gaplog_len > 0} {
+                set list_result [$S GTIDX GAPLOG LIST 0 $gaplog_len]
+                assert {[llength $list_result] == $gaplog_len}
+
+
+                set first_entry [lindex $list_result 0]
+                set first_uuid [lindex $first_entry 0]
+                set first_gno [lindex $first_entry 1]
+                set deleted [$S GTIDX GAPLOG DELETERANGE $first_uuid $first_gno $first_gno]
+                assert {$deleted == 1}
+
+                set after_list [$S GTIDX GAPLOG LIST 0 $gaplog_len]
+                assert {[llength $after_list] == [expr {$gaplog_len - 1}]}
+
+                if {[llength $list_result] >= 2} {
+                    set second_before [lindex $list_result 1]
+                    set first_after [lindex $after_list 0]
+                    assert_equal [lindex $second_before 0] [lindex $first_after 0]
+                    assert_equal [lindex $second_before 1] [lindex $first_after 1]
+                }
+            }
         }
     }
 }

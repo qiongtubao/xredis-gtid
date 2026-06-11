@@ -1,7 +1,8 @@
+
 proc get_info_property {r section line property} {
     set str [$r info $section]
     if {[regexp ".*${line}:\[^\r\n\]*${property}=(\[^,\r\n\]*).*" $str match submatch]} {
-        set submatch
+        set _ $submatch
     }
 }
 
@@ -211,7 +212,9 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             # Slave writes MULTI/EXEC transaction independently
             $S MULTI
             $S set s_multi_key1 s_multi_val1
+            $S select 2
             $S set s_multi_key2 s_multi_val2
+            $S select 3
             $S set s_multi_key3 s_multi_val3
             $S EXEC
 
@@ -248,8 +251,11 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # Verify data
             assert_equal [$S get m_key] m_val
+            $S select 1
             assert_equal [$S get s_multi_key1] s_multi_val1
+            $S select 2
             assert_equal [$S get s_multi_key2] s_multi_val2
+            $S select 3
             assert_equal [$S get s_multi_key3] s_multi_val3
         }
     }

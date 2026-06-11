@@ -11,7 +11,7 @@
 proc get_info_property {r section line property} {
     set str [$r info $section]
     if {[regexp ".*${line}:\[^\r\n\]*${property}=(\[^,\r\n\]*).*" $str match submatch]} {
-        set submatch
+        set _ $submatch
     }
 }
 

@@ -81,3 +81,28 @@ proc repl_ack_off_aligned {master} {
 
     set _ $aligned
 }
+
+proc get_gaplog_entries {client} {
+    set info [$client INFO gtid]
+    foreach line [split $info "\r\n"] {
+        if {[string match "gtid_gaplog_entries:*" $line]} {
+            return [string range $line 20 end]
+        }
+    }
+    return 0
+}
+
+proc get_slave_gtid_uuid {client} {
+    set seq [$client GTIDX seq gtid.set]
+    set parts [split $seq ","]
+    if {[llength $parts] >= 2} {
+        set uuid_gno [lindex $parts 1]
+        set uuid [lindex [split $uuid_gno ":"] 0]
+        return $uuid
+    } elseif {[llength $parts] == 1} {
+        set uuid_gno [lindex $parts 0]
+        set uuid [lindex [split $uuid_gno ":"] 0]
+        return $uuid
+    }
+    return ""
+}

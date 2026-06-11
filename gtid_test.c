@@ -879,7 +879,7 @@ int test_uuidSetNextEncode() {
     next_len = uuidSetNextEncode(next, maxlen, B, 1);
     next[next_len] = '\0';
     long long gno = 0;
-    int sid_len = 0;
+    size_t sid_len = 0;
     uuidGnoDecode(next, next_len, &gno, &sid_len);
     assert(strcmp("B:27", next) == 0);
     assert(gno == 27);
@@ -1100,7 +1100,7 @@ int test_gtidSetAdd() {
 
 int test_uuidGnoDecode() {
     long long gno = 0;
-    int uuid_index = 0;
+    size_t uuid_index = 0;
     char* uuid = uuidGnoDecode("ABCD:1", 6, &gno, &uuid_index);
     assert(uuid_index == 4);
     assert(strncmp(uuid, "ABCD", uuid_index) == 0);
@@ -1522,6 +1522,111 @@ int test_gtidSeqPsync() {
     return 1;
 }
 
+int test_uuidSetIteratorNext() {
+    /* single interval */
+    uuidSet *us1 = uuidSetNew("uuid-1", 6);
+    uuidSetAdd(us1, 1, 5);
+
+    uuidSetIterator it1;
+    uuidSetInitIterator(&it1, us1);
+    int count = 0;
+    gno_t total = 0;
+    gtidIntervalNode *n;
+    while ((n = uuidSetIteratorNext(&it1)) != NULL) {
+        assert(n->start >= 1 && n->end <= 5);
+        total += (n->end - n->start + 1);
+        count++;
+    }
+    uuidSetDeinitIterator(&it1);
+    assert(count == 1);
+    assert(total == 5);
+
+    /* iteration past end returns NULL */
+    assert(uuidSetIteratorNext(&it1) == NULL);
+    uuidSetFree(us1);
+
+    /* multiple disjoint intervals (use gaps so they don't merge) */
+    uuidSet *us2 = uuidSetNew("uuid-2", 6);
+    uuidSetAdd(us2, 1, 3);
+    uuidSetAdd(us2, 10, 12);
+    uuidSetAdd(us2, 20, 22);
+
+    uuidSetIterator it2;
+    uuidSetInitIterator(&it2, us2);
+    gno_t seen[3][2];
+    int i = 0;
+    while ((n = uuidSetIteratorNext(&it2)) != NULL) {
+        assert(i < 3);
+        seen[i][0] = n->start;
+        seen[i][1] = n->end;
+        i++;
+    }
+    uuidSetDeinitIterator(&it2);
+    assert(i == 3);
+    assert(seen[0][0] == 1  && seen[0][1] == 3);
+    assert(seen[1][0] == 10 && seen[1][1] == 12);
+    assert(seen[2][0] == 20 && seen[2][1] == 22);
+
+    /* empty uuid set: init then immediately next should give NULL */
+    uuidSet *us3 = uuidSetNew("uuid-3", 6);
+    uuidSetIterator it3;
+    uuidSetInitIterator(&it3, us3);
+    assert(uuidSetIteratorNext(&it3) == NULL);
+    uuidSetDeinitIterator(&it3);
+    uuidSetFree(us3);
+
+    uuidSetFree(us2);
+    return 1;
+}
+
+int test_gtidSetIteratorNext() {
+    /* build a gtidSet with 3 uuidSets, each with one interval */
+    uuidSet *a = uuidSetNew("uuid-A", 6); uuidSetAdd(a, 1, 5);
+    uuidSet *b = uuidSetNew("uuid-B", 6); uuidSetAdd(b, 100, 100);
+    uuidSet *c = uuidSetNew("uuid-C", 6); uuidSetAdd(c, 7, 9);
+
+    gtidSet *gs = gtidSetNew();
+    gtidSetAppend(gs, a);
+    gtidSetAppend(gs, b);
+    gtidSetAppend(gs, c);
+
+    gtidSetIterator it;
+    gtidSetInitIterator(&it, gs);
+    uuidSet *picked[3];
+    int i = 0;
+    uuidSet *cur;
+    while ((cur = gtidSetIteratorNext(&it)) != NULL) {
+        assert(i < 3);
+        picked[i++] = cur;
+    }
+    gtidSetDeinitIterator(&it);
+    assert(i == 3);
+    /* iteration order should be insertion order: A, B, C */
+    assert(picked[0] == a);
+    assert(picked[1] == b);
+    assert(picked[2] == c);
+    /* uuid contents still readable through the picked pointers */
+    assert(picked[0]->uuid_len == 6 && memcmp(picked[0]->uuid, "uuid-A", 6) == 0);
+    assert(picked[1]->uuid_len == 6 && memcmp(picked[1]->uuid, "uuid-B", 6) == 0);
+    assert(picked[2]->uuid_len == 6 && memcmp(picked[2]->uuid, "uuid-C", 6) == 0);
+
+    /* past end returns NULL */
+    assert(gtidSetIteratorNext(&it) == NULL);
+    gtidSetDeinitIterator(&it);
+
+    /* empty gtidSet: iter is NULL right away */
+    gtidSet *empty = gtidSetNew();
+    gtidSetIterator it2;
+    gtidSetInitIterator(&it2, empty);
+    assert(gtidSetIteratorNext(&it2) == NULL);
+    gtidSetDeinitIterator(&it2);
+    gtidSetFree(empty);
+
+    /* gtidSetFree releases its uuidSets (don't double-free) */
+    gtidSetFree(gs);
+    return 1;
+}
+
 int __failed_tests = 0;
 int __test_num = 0;
 #define test_cond(descr,_c) do { \
@@ -1611,6 +1716,10 @@ int test_api(void) {
             test_gtidSeqXsync() == 1);
         test_cond("gtidSeqPsync function",
             test_gtidSeqPsync() == 1);
+        test_cond("gtidSetIteratorNext function",
+            test_gtidSetIteratorNext() == 1);
+        test_cond("uuidSetIteratorNext function",
+            test_uuidSetIteratorNext() == 1);
 
     } test_report()
     return 1;
