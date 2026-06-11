@@ -30,7 +30,6 @@
 #include <gtid.h>
 #include <ctype.h>
 
-
 int isGtidExecCommand(client* c) {
     return c->cmd->proc == gtidCommand && c->argc > GTID_COMMAN_ARGC &&
         strcasecmp(c->argv[GTID_COMMAN_ARGC]->ptr, "exec") == 0;
@@ -381,6 +380,13 @@ sds genGtidInfoString(sds info) {
     }
     info = sdscatprintf(info,"\r\n");
 
+    /* Output gaplog statistics for testing and operations observation */
+    if (server.gtid_gap_log != NULL) {
+        info = sdscatprintf(info,
+                "gtid_gaplog_entries:%lld\r\n",
+                server.gtid_gap_log->size);
+    }
+
     return info;
 }
 
@@ -425,6 +431,16 @@ void gtidxCommand(client *c) {
             "    Locate xsync continue position",
             "UUID-INTRESTED SET <*|?>",
             "    SET uuid.interested to * or ?",
+            "GAPLOG LEN",
+            "    Get gaplog entries count.",
+            "GAPLOG RANGE <uuid> <start> <end>",
+            "    Query gaplog entries by uuid and gno range.",
+            "GAPLOG DELETERANGE <uuid> <start> <end>",
+            "    Delete gaplog entries by uuid and gno range.",
+            "GAPLOG LIST <start> <count>",
+            "    List gaplog entries by global order.",
+            "GAPLOG CLEAR",
+            "    Clear all gaplog entries.",
             NULL
         };
         addReplyHelp(c, help);
@@ -594,6 +610,223 @@ void gtidxCommand(client *c) {
         } else {
             addReplyError(c,"Syntax error");
         }
+    } else if (!strcasecmp(c->argv[1]->ptr,"gaplog") && c->argc >= 3) {
+        if (!strcasecmp(c->argv[2]->ptr,"len") && c->argc == 3)  {
+            addReplyLongLong(c, server.gtid_gap_log->size);
+        } else if (!strcasecmp(c->argv[2]->ptr,"range") && c->argc == 6) {
+            /* GTIDX GAPLOG RANGE <uuid> <start_gno> <end_gno> */
+            sds uuid = c->argv[3]->ptr;
+            long long start_gno, end_gno;
+            if (getLongLongFromObjectOrReply(c, c->argv[4], &start_gno, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[5], &end_gno, NULL) != C_OK) return;
+            dictEntry *de = dictFind(server.gtid_gap_log->data, uuid);
+            if (de == NULL) {
+                addReplyArrayLen(c, 0);
+                return;
+            }
+            skiplist *sl = dictGetVal(de);
+            skiplistNode *node = sl->header;
+            for (int i = sl->level - 1; i >= 0; i--) {
+                while (node->level[i].forward && node->level[i].forward->score < start_gno)
+                    node = node->level[i].forward;
+            }
+            node = node->level[0].forward;
+
+            long count = 0;
+            skiplistNode *tmp = node;
+            while (tmp && tmp->score <= end_gno) {
+                count++;
+                tmp = tmp->level[0].forward;
+            }
+            addReplyArrayLen(c, count * 2);
+            while (node && node->score <= end_gno) {
+                addReplyLongLong(c, node->score);
+                gtidGapLogKeysInfos *kis = (gtidGapLogKeysInfos*)node->value;
+                addReplyArrayLen(c, kis->size);
+                for (int i = 0; i < kis->size; i++) {
+                    gtidGapLogKeyInfo *ki = kis->keys[i];
+                    addReplyArrayLen(c, 4);
+                    addReplyBulkLongLong(c, ki->dbid);
+                    robj o = {
+                        .type = ki->key_type
+                    };
+                    addReplyBulkCString(c, getObjectTypeName(&o));
+                    addReplyBulkCBuffer(c, ki->key, sdslen(ki->key));
+                    addReplyArrayLen(c, ki->subkeys_count);
+                    for (int j = 0; j < ki->subkeys_count; j++) {
+                        addReplyBulkCBuffer(c, ki->subkeys[j], sdslen(ki->subkeys[j]));
+                    }
+                }
+                node = node->level[0].forward;
+            }
+        } else if (!strcasecmp(c->argv[2]->ptr,"deleterange") && c->argc == 6) {
+            sds uuid = c->argv[3]->ptr;
+            long long start_gno, end_gno;
+            if (getLongLongFromObjectOrReply(c, c->argv[4], &start_gno, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[5], &end_gno, NULL) != C_OK) return;
+            if (start_gno > end_gno) {
+                addReplyError(c, "start gno must be <= end gno");
+                return;
+            }
+
+            long long deleted = 0;
+            dictEntry *de = dictFind(server.gtid_gap_log->data, uuid);
+            if (de != NULL) {
+                skiplist *sl = dictGetVal(de);
+                for (gno_t gno = start_gno; gno <= end_gno; gno++) {
+                    if (deleteSkipList(sl, gno)) {
+                        deleted++;
+                    }
+                }
+                if (sl->length == 0) {
+                    dictDelete(server.gtid_gap_log->data, uuid);
+                }
+                server.gtid_gap_log->size -= deleted;
+            }
+
+            gno_t history_removed = 0;
+            listNode *ln = listFirst(server.gtid_gap_log->history);
+            while (ln) {
+                uuidSet *us = listNodeValue(ln);
+                listNode *next_ln = listNextNode(ln);
+                if (us->uuid_len == sdslen(uuid) &&
+                    memcmp(us->uuid, uuid, sdslen(uuid)) == 0) {
+                    history_removed += uuidSetRemove(us, start_gno, end_gno);
+                    if (uuidSetCount(us) == 0) {
+                        listDelNode(server.gtid_gap_log->history, ln);
+                    }
+                }
+                ln = next_ln;
+            }
+
+            if (history_removed != deleted) {
+                serverLog(LL_WARNING,
+                    "[gaplog] deleterange mismatch: data deleted %lld, history removed %lld for uuid %s range %lld-%lld",
+                    deleted, (long long)history_removed, uuid, start_gno, end_gno);
+                serverAssert(history_removed != deleted);
+            }
+
+            if (deleted > 100) {
+                serverLog(LL_NOTICE,
+                    "[gaplog] deleterange deleted %lld entries for uuid %s range %lld-%lld",
+                    deleted, uuid, start_gno, end_gno);
+            }
+            addReplyLongLong(c, deleted);
+        } else if (!strcasecmp(c->argv[2]->ptr,"list") && c->argc == 5) {
+            long long start_idx, count;
+            if (getLongLongFromObjectOrReply(c, c->argv[3], &start_idx, NULL) != C_OK) return;
+            if (getLongLongFromObjectOrReply(c, c->argv[4], &count, NULL) != C_OK) return;
+            if (start_idx < 0 || count <= 0) {
+                addReplyError(c, "start must be >= 0 and count must be > 0");
+                return;
+            }
+            if (count > 1000) {
+                addReplyError(c, "count must be <= 1000");
+                return;
+            }
+
+            typedef struct {
+                sds uuid;
+                gno_t gno;
+            } gaplogEntryRef;
+
+            gaplogEntryRef *refs = zmalloc(sizeof(gaplogEntryRef) * count);
+            int nrefs = 0;
+            long long idx = 0;
+            int found_start = 0;
+
+            listNode *ln = listFirst(server.gtid_gap_log->history);
+            while (ln && nrefs < count) {
+                uuidSet *us = listNodeValue(ln);
+                gno_t us_count = uuidSetCount(us);
+
+
+                if (!found_start) {
+                    if (idx + us_count <= start_idx) {
+                        idx += us_count;
+                        ln = listNextNode(ln);
+                        continue;
+                    }
+                }
+
+                gtidIntervalNode *node = us->intervals->header->forwards[0];
+                while (node && nrefs < count) {
+                    gno_t interval_len = node->end - node->start + 1;
+
+                    if (!found_start) {
+                        if (idx + interval_len <= start_idx) {
+                            idx += interval_len;
+                            node = node->forwards[0];
+                            continue;
+                        }
+                    }
+
+                    for (gno_t gno = node->start; gno <= node->end; gno++) {
+                        if (!found_start) {
+                            if (idx == start_idx) {
+                                found_start = 1;
+                            } else {
+                                idx++;
+                                continue;
+                            }
+                        }
+                        refs[nrefs].uuid = sdsnewlen(us->uuid, us->uuid_len);
+                        refs[nrefs].gno = gno;
+                        nrefs++;
+                        if (nrefs >= count) break;
+                    }
+                    node = node->forwards[0];
+                }
+                ln = listNextNode(ln);
+            }
+
+            addReplyArrayLen(c, nrefs);
+            for (int i = 0; i < nrefs; i++) {
+                addReplyArrayLen(c, 3);
+                addReplyBulkCBuffer(c, refs[i].uuid, sdslen(refs[i].uuid));
+                addReplyLongLong(c, refs[i].gno);
+
+                dictEntry *de = dictFind(server.gtid_gap_log->data, refs[i].uuid);
+                if (de != NULL) {
+                    skiplist *sl = dictGetVal(de);
+                    skiplistNode *node = sl->header;
+                    for (int j = sl->level - 1; j >= 0; j--) {
+                        while (node->level[j].forward &&
+                               node->level[j].forward->score < refs[i].gno)
+                            node = node->level[j].forward;
+                    }
+                    node = node->level[0].forward;
+                    if (node && node->score == refs[i].gno) {
+                        gtidGapLogKeysInfos *kis = (gtidGapLogKeysInfos*)node->value;
+                        addReplyArrayLen(c, kis->size);
+                        for (int k = 0; k < kis->size; k++) {
+                            gtidGapLogKeyInfo *ki = kis->keys[k];
+                            addReplyArrayLen(c, 4);
+                            addReplyBulkLongLong(c, ki->dbid);
+                            robj o = { .type = ki->key_type };
+                            addReplyBulkCString(c, getObjectTypeName(&o));
+                            addReplyBulkCBuffer(c, ki->key, sdslen(ki->key));
+                            addReplyArrayLen(c, ki->subkeys_count);
+                            for (int j = 0; j < ki->subkeys_count; j++) {
+                                addReplyBulkCBuffer(c, ki->subkeys[j], sdslen(ki->subkeys[j]));
+                            }
+                        }
+                    } else {
+                        addReplyArrayLen(c, 0);
+                    }
+                } else {
+                    addReplyArrayLen(c, 0);
+                }
+                sdsfree(refs[i].uuid);
+            }
+            zfree(refs);
+        } else if (!strcasecmp(c->argv[2]->ptr,"clear") && c->argc == 3) {
+            resetGtidGapLog(server.gtid_gap_log);
+            addReply(c,shared.ok);
+        } else {
+            addReplySubcommandSyntaxError(c);
+        }
+
     } else {
         addReplySubcommandSyntaxError(c);
     }
