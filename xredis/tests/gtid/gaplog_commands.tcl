@@ -145,7 +145,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 2. Master writes data
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # 3. Slave disconnects and writes MULTI/EXEC independently
             $S replicaof no one

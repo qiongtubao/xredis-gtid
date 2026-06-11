@@ -8,12 +8,6 @@
 # 3. Slave reconnects
 # 4. Verify gaplog recorded keys are correct
 
-proc get_info_property {r section line property} {
-    set str [$r info $section]
-    if {[regexp ".*${line}:\[^\r\n\]*${property}=(\[^,\r\n\]*).*" $str match submatch]} {
-        set _ $submatch
-    }
-}
 
 proc get_gaplog_entries {client} {
     set info [$client INFO gtid]
@@ -64,7 +58,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -142,7 +136,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -212,7 +206,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -280,7 +274,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -358,7 +352,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -421,7 +415,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -477,7 +471,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -551,7 +545,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -604,7 +598,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -656,7 +650,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one
@@ -711,7 +705,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             $S replicaof $M_host $M_port
             wait_for_sync $S
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Disconnect and write independently
             $S replicaof no one

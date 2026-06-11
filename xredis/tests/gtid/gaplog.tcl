@@ -1,10 +1,4 @@
 
-proc get_info_property {r section line property} {
-    set str [$r info $section]
-    if {[regexp ".*${line}:\[^\r\n\]*${property}=(\[^,\r\n\]*).*" $str match submatch]} {
-        set _ $submatch
-    }
-}
 
 proc get_gaplog_entries {client} {
     set info [$client INFO gtid]
@@ -89,7 +83,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             $M set m_key1 m_val1
             $M set m_key2 m_val2
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             $S replicaof no one
             after 100
@@ -115,13 +109,13 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
 
             set result [$S GTIDX GAPLOG RANGE $slave_uuid 1 2]
-            assert_match "*s_key1*" $result
-            assert_match "*s_key2*" $result
 
+            set result_str [join $result " "]
+            assert_match "*s_key1*" $result_str
+            assert_match "*s_key2*" $result_str
 
             assert_equal [$S get m_key1] m_val1
             assert_equal [$S get m_key2] m_val2
-
 
             assert_equal [$S get s_key1] s_val1
             assert_equal [$S get s_key2] s_val2
@@ -149,7 +143,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
                 $MA set ma_key1 ma_val1
                 $MA set ma_key2 ma_val2
                 $MA set ma_key3 ma_val3
-                wait_for_sync $S
+                wait_for_ofs_sync $S $MA
 
                 # 3. Slave disconnects
                 $S replicaof no one
@@ -203,7 +197,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 2. Master writes data
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # 3. Slave disconnects and writes MULTI/EXEC independently
             $S replicaof no one
@@ -280,7 +274,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 2. Master writes data
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # 3. Slave disconnects and writes Lua script independently
             $S replicaof no one
@@ -421,7 +415,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 2. Master writes data
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # 3. Slave disconnects and writes many keys independently
             $S replicaof no one
@@ -450,7 +444,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             set result [$S GTIDX GAPLOG RANGE $slave_uuid 1 $num_writes]
             # Verify all keys are in the result
             for {set i 1} {$i <= $num_writes} {incr i} {
-                assert_match "*s_key_$i*" $result
+                assert_match "*s_key_$i*" $result_str
             }
 
             # Verify data
@@ -480,7 +474,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 2. Master writes data
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # 3. Slave disconnects and writes different data types
             $S replicaof no one
@@ -547,7 +541,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 2. Master writes data to db0
             $M set m_key m_val
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # Verify slave has data in db0
             assert_equal [$S get m_key] m_val
@@ -583,7 +577,8 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
 
             # 6. Verify gaplog recorded keys are correct
             set result [$S GTIDX GAPLOG RANGE $slave_uuid 1 1]
-            assert_match "*s_db0_key*" $result
+            set result_str [join $result " "]
+            assert_match "*s_db0_key*" $result_str
 
             # Verify data (slave currently in db0)
             assert_equal [$S get m_key] m_val
@@ -611,7 +606,7 @@ start_server {tags {"gaplog"} overrides {gtid-enabled yes gtid-gaplog-enabled ye
             # 2. Master writes data
             $M set m_key1 m_val1
             $M set m_key2 m_val2
-            wait_for_sync $S
+            wait_for_ofs_sync $S $M
 
             # 3. Slave disconnects and writes DEL command
             $S replicaof no one
