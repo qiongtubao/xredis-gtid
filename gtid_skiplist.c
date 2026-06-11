@@ -8,7 +8,7 @@
 #include <gtid_malloc.h>
 #include <math.h>
 
-static skiplistNode *createSkiplistNode(int level, long long score,
+static skiplistNode *skiplistNodeCreate(int level, long long score,
                                                      void *value) {
     skiplistNode *node = gtid_malloc(sizeof(skiplistNode) +
                                        sizeof(node->level[0]) * level);
@@ -20,39 +20,39 @@ static skiplistNode *createSkiplistNode(int level, long long score,
     return node;
 }
 
-static void freeSkiplistNode(skiplist* sl, skiplistNode *node) {
+static void skiplistNodeFree(skiplist* sl, skiplistNode *node) {
     if (node->value) sl->type->freeValue(node->value);
     gtid_free(node);
 }
-skiplist* createSkipList(skipType* type) {
+skiplist* skiplistCreate(skipType* type) {
     skiplist *sl = gtid_malloc(sizeof(skiplist));
     sl->level = 1;
     sl->length = 0;
     sl->tail = NULL;
     sl->type = type;
-    sl->header = createSkiplistNode(SKIPLIST_MAXLEVEL, 0, NULL);
+    sl->header = skiplistNodeCreate(SKIPLIST_MAXLEVEL, 0, NULL);
     return sl;
 }
 
-void freeSkipList(skiplist *sl) {
+void skiplistFree(skiplist *sl) {
     skiplistNode *node = sl->header->level[0].forward;
     gtid_free(sl->header);
     while (node) {
         skiplistNode *next = node->level[0].forward;
-        freeSkiplistNode(sl,node);
+        skiplistNodeFree(sl,node);
         node = next;
     }
     gtid_free(sl);
 }
 
-static int randomLevelSkiplist(void) {
+static int skiplistRandomLevel(void) {
     int level = 1;
     while (level < SKIPLIST_MAXLEVEL && (random() & 0x3) == 0)
         level++;
     return level;
 }
 
-int tryInsertSkipList(skiplist *sl, long long score,
+int skiplistInsert(skiplist *sl, long long score,
                            void *value, int score_unique) {
     skiplistNode *update[SKIPLIST_MAXLEVEL];
     skiplistNode *x = sl->header;
@@ -67,14 +67,14 @@ int tryInsertSkipList(skiplist *sl, long long score,
     }
     
     
-    int level = randomLevelSkiplist();
+    int level = skiplistRandomLevel();
     if (level > sl->level) {
         for (int i = sl->level; i < level; i++)
             update[i] = sl->header;
         sl->level = level;
     }
 
-    x = createSkiplistNode(level, score, value);
+    x = skiplistNodeCreate(level, score, value);
     for (int i = 0; i < level; i++) {
         x->level[i].forward = update[i]->level[i].forward;
         update[i]->level[i].forward = x;
@@ -90,7 +90,7 @@ int tryInsertSkipList(skiplist *sl, long long score,
     return 1;
 }
 
-int deleteSkipList(skiplist *sl, long long score) {
+int skiplistDelete(skiplist *sl, long long score) {
     skiplistNode* update[SKIPLIST_MAXLEVEL];
     skiplistNode* x = sl->header;
 
@@ -116,16 +116,16 @@ int deleteSkipList(skiplist *sl, long long score) {
     while (sl->level > 1 && sl->header->level[sl->level - 1].forward == NULL)
         sl->level--;
 
-    freeSkiplistNode(sl, x);
+    skiplistNodeFree(sl, x);
     sl->length--;
     return 1;
 }
 
-skiplistNode* firstSkipList(skiplist *sl) {
+skiplistNode* skiplistFirst(skiplist *sl) {
     return sl->header->level[0].forward;
 }
 
-skiplistNode* findFirstGteSkipList(skiplist *sl, long long target) {
+skiplistNode* skiplistFindFirstGte(skiplist *sl, long long target) {
     skiplistNode *x = sl->header;
     for (int i = sl->level - 1; i >= 0; i--) {
         while (x->level[i].forward && x->level[i].forward->score < target)
@@ -163,7 +163,7 @@ skiplistNode *skiplistIteratorNext(skiplistIterator *it) {
 }
 
 int skiplistIteratorSeek(skiplistIterator *it, long long target) {
-    skiplistNode *node = findFirstGteSkipList(it->sl, target);
+    skiplistNode *node = skiplistFindFirstGte(it->sl, target);
     if (node == NULL) {
         it->next = NULL;
         return 0;

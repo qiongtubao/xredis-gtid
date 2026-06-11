@@ -160,7 +160,7 @@ gtidIntervalSkipList *gtidIntervalSkipListDup(gtidIntervalSkipList *gsl) {
     return dup;
 }
 
-static int gitdIntervalRandomLevel(void) {
+static int gtidIntervalRandomLevel(void) {
     int level = 1;
     while ((rand()&0xFFFF) < (GTID_INTERVAL_SKIPLIST_P * 0xFFFF))
         level += 1;
@@ -204,7 +204,7 @@ gno_t gtidIntervalSkipListAdd(gtidIntervalSkipList *gsl, gno_t start, gno_t end)
 
     if (lefts[0] == rights[0]) {
         /* none overlaps with [start, end]: create new one. */
-        level = gitdIntervalRandomLevel();
+        level = gtidIntervalRandomLevel();
         x = gtidIntervalNodeNew(level,start,end);
 
        if (level > gsl->level) {
@@ -292,7 +292,7 @@ gno_t gtidIntervalSkipListRemove(gtidIntervalSkipList *gsl, gno_t start,
 
     if (rights[0]->end < lefts[0]->start) {
         /* remove gno within one node: split it. */
-        int level = gitdIntervalRandomLevel();
+        int level = gtidIntervalRandomLevel();
         x = gtidIntervalNodeNew(level,end+1,lefts[0]->end);
         lefts[0]->end = start-1;
 
@@ -804,6 +804,7 @@ gno_t gtidSetDiff(gtidSet* dst, gtidSet* src) {
             if (dst->header == cur) dst->header = next;
             if (dst->tail == cur) dst->tail = prev;
             if (dst->cached == cur) dst->cached = NULL;
+            if (dst->current == cur) dst->current = NULL;
             uuidSetFree(cur);
         } else {
             prev = cur;
@@ -883,7 +884,7 @@ int gtidSetRelated(gtidSet *set1, gtidSet *set2) {
 /*gtidSet iterator*/
 int gtidSetInitIterator(gtidSetIterator* iterator, gtidSet* gtid_set) {
     iterator->gtid_set = gtid_set;
-    iterator->next = gtid_set->header;;
+    iterator->next = gtid_set->header;
     return 1;
 }
 void gtidSetDeinitIterator(gtidSetIterator* iterator) {
@@ -1275,4 +1276,12 @@ void gtidSeqGetStat(gtidSeq *seq, gtidSeqStat *stat) {
     stat->freeseg_memory = seq->nfreeseg*sizeof(gtidSegment) +
         seq->nfreeseg_deltas*sizeof(segoff_t);
     stat->used_memory = stat->segment_memory + stat->freeseg_memory;
+}
+
+void gtidSeqRebaseOffset(gtidSeq *seq, size_t offset) {
+    gtidSegment *seg = seq->firstseg;
+    while (seg) {
+        seg->base_offset += offset;
+        seg = seg->next;
+    }
 }

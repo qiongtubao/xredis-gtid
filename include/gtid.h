@@ -202,6 +202,7 @@ typedef struct gtidSeqStat {
 } gtidSeqStat;
 
 gtidSeq *gtidSeqCreate();
+void gtidSeqRebaseOffset(gtidSeq *seq, size_t offset);
 void gtidSeqDestroy(gtidSeq *seq);
 void gtidSeqAppend(gtidSeq *seq, const char *uuid, size_t uuid_len, gno_t gno, long long offset);
 void gtidSeqTrim(gtidSeq *seq, long long until);
@@ -238,14 +239,12 @@ typedef struct skiplist {
     skipType* type;
 } skiplist;
 struct
-skiplist* createSkipList(skipType* type);
-void freeSkipList(skiplist *sl);
-int tryInsertSkipList(skiplist *sl, long long score, void *value, int score_unique);
-
-int deleteSkipList(skiplist *sl, long long score);
-skiplistNode* firstSkipList(skiplist *sl);
-
-skiplistNode* findFirstGteSkipList(skiplist *sl, long long target);
+skiplist* skiplistCreate(skipType* type);
+void skiplistFree(skiplist *sl);
+int skiplistInsert(skiplist *sl, long long score, void *value, int score_unique);
+int skiplistDelete(skiplist *sl, long long score);
+skiplistNode* skiplistFirst(skiplist *sl);
+skiplistNode* skiplistFindFirstGte(skiplist *sl, long long target);
 
 typedef struct skiplistIterator {
     skiplist *sl;
