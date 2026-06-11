@@ -306,10 +306,11 @@ void gtidGapLogRelease(gtidGapLog* gaplog);
 int gtidGapLogTrim(gtidGapLog* log ,size_t size);
 
 typedef struct gtidGapLogDataIterator {
-  skiplistNode* node;
+  skiplistIterator sl_iter;
 } gtidGapLogDataIterator;
-void gtidGapLogInitDataIterator(gtidGapLogDataIterator *iter, skiplist *sl, gno_t start_gno);
+void gtidGapLogDataInitIterator(gtidGapLogDataIterator *iter, skiplist *sl, gno_t start_gno);
 void gtidGapLogDeinitDataIterator(gtidGapLogDataIterator *iter);
+void gtidGapLogDataIteratorSeek(gtidGapLogDataIterator *iter, gno_t gno);
 gno_t gtidGapLogDataGetGno(gtidGapLogDataIterator* iter);
 gtidGapLogKeys* gtidGapLogDataNext(gtidGapLogDataIterator* iterator);
 
@@ -324,6 +325,7 @@ void gtidGapLogInitHistoryIterator(gtidGapLogHistoryIterator* iter,
                                     gtidGapLog* gaplog, long long index);
 gno_t gtidGapLogHistoryNext(gtidGapLogHistoryIterator* iter,
                              const char** uuid, size_t* uuid_len);
+void gtidGapLogHistoryIteratorSeek(gtidGapLogHistoryIterator* iter, gno_t gno);
 void gtidGapLogDeinitHistoryIterator(gtidGapLogHistoryIterator* iter);
 
 void addReplyGtidGapLogKeys(client* c, gtidGapLogKeys* keys);

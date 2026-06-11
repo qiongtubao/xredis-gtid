@@ -2069,7 +2069,7 @@ int gtidTest(int argc, char **argv, int accurate) {
 
         
         gtidGapLogDataIterator iter;
-        gtidGapLogInitDataIterator(&iter, sl, 1);
+        gtidGapLogDataInitIterator(&iter, sl, 1);
 
         
         gno_t gno = gtidGapLogDataGetGno(&iter);
@@ -2095,7 +2095,7 @@ int gtidTest(int argc, char **argv, int accurate) {
 
         gtidGapLogDeinitDataIterator(&iter);
 
-        gtidGapLogInitDataIterator(&iter, sl, 3);
+        gtidGapLogDataInitIterator(&iter, sl, 3);
         gno = gtidGapLogDataGetGno(&iter);
         test_assert(gno == 5); /* gno=1 */
         gtidGapLogKeys *k_mid = gtidGapLogDataNext(&iter);
@@ -2103,7 +2103,7 @@ int gtidTest(int argc, char **argv, int accurate) {
         test_assert(sdslen(k_mid->keys[0]->key) == 7); /* "hashkey" */
         gtidGapLogDeinitDataIterator(&iter);
 
-        gtidGapLogInitDataIterator(&iter, sl, 10);
+        gtidGapLogDataInitIterator(&iter, sl, 10);
         gno = gtidGapLogDataGetGno(&iter);
         test_assert(gno == -1); /* not find note */
         gtidGapLogKeys *k_empty = gtidGapLogDataNext(&iter);
