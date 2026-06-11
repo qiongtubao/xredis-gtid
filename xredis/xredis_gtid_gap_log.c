@@ -46,7 +46,7 @@ void gtidGaplogRelease(gtidGaplog* gaplog) {
 
 void gtidGaplogKeysRelease(void *data) {
     if (data == NULL) return;
-    gtidGaplogKeys* keys = (gtidGaplogKeys*)data;  
+    gtidGaplogKeys* keys = (gtidGaplogKeys*)data;
     for (size_t i = 0; i < keys->size; i++) {
         gtidGaplogKeyRelease(keys->keys[i]);
     }
@@ -99,12 +99,12 @@ gtidGaplogKey** gtidGaplogKeysPrepareBuilder(gtidGaplogKeysBuilder* builder, int
 
 void gtidGaplogDeinitKeysBuilder(gtidGaplogKeysBuilder* builer) {
     for (int i  = 0; i < builer->numkeys; i++) {
-        gtidGaplogKeyRelease(builer->keys_infos[i]);  
+        gtidGaplogKeyRelease(builer->keys_infos[i]);
         builer->keys_infos[i] = NULL;
     }
     if (builer && builer->keys_infos != builer->cache) {
         zfree(builer->keys_infos);
-    }   
+    }
 }
 
 gtidGaplogKeys* gtidGaplogKeysBuild(gtidGaplogKeysBuilder* builder) {
@@ -285,7 +285,7 @@ int gtidGaplogTrim(gtidGaplog* gap_log ,size_t size) {
         }
         gap_log->size--;
         count++;
-        
+
     }
     return count;
 }

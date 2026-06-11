@@ -293,7 +293,7 @@ int cmdGetKeyType(struct redisCommand *cmd);
 typedef struct gtidGaplog {
   dict* data;           //dict<uuid, skiplist<gtidGaplogKey>>
   list* history;   //list<uuidSet>
-  size_t size;  
+  size_t size;
 } gtidGaplog;
 
 gtidGaplog* gtidGaplogNew();

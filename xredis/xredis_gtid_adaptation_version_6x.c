@@ -322,4 +322,4 @@ struct redisCommand* gtidGetGtidCommand() {
 }
 struct redisCommand* gtidGetExecCommand() {
     return server.execCommand;
-}     
+}

@@ -81,7 +81,7 @@ void ctrip_replicationFeedSlaves(list* saves,int dictid, robj **argv,
 #ifdef ENABLE_SWAP
     touch_index = touch_index && server.swap_draining_master == NULL;
 #endif
-   
+
     if (touch_index) gtidSeqAppend(server.gtid_seq,uuid,uuid_len,gno,offset);
     replicationFeedSlaves(saves, dictid,argv,argc);
 }
@@ -163,7 +163,7 @@ long long consumeReplicationBacklogLimited(long long offset, long long limit,
 
 void consumeReplicationBacklogLimitedAddReplyCb(char *p,
         long long thislen, void *pd) {
-    //can't use addReplySds send slave message, because client will be closed by underlying layer  
+    //can't use addReplySds send slave message, because client will be closed by underlying layer
     if (connWrite(((client*)pd)->conn,p,thislen) != thislen) {
         serverLog(LL_WARNING, "[consumeReplicationBacklogLimitedAddReplyCb] send slave fail");
         freeClientAsync((client*)pd);
@@ -224,7 +224,7 @@ void feedAppendOnlyFileGtid(struct redisCommand* cmd, int dictid, robj **argv, i
 
 void ctrip_feedAppendOnlyFile(struct redisCommand *cmd, int dictid,
         robj **argv, int argc) {
-    if (isGtidCommand(cmd)) 
+    if (isGtidCommand(cmd))
         feedAppendOnlyFileGtid(cmd,dictid,argv,argc);
     else
         feedAppendOnlyFile(dictid,argv,argc);

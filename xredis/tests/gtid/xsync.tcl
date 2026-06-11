@@ -1611,7 +1611,7 @@ start_server {tags {"xsync"} overrides {gtid-enabled yes}} {
         $M config set repl-backlog-size 16484
         for {set i 0} {$i < 100} {incr i} {
             $M set key-$i val-$i
-        } 
+        }
 
 
         for {set j 0} {$j < 3} {incr j} {
@@ -1621,17 +1621,17 @@ start_server {tags {"xsync"} overrides {gtid-enabled yes}} {
             } else {
                  $M config set gtid-enabled yes
             }
-           
+
 
             for {set i 0} {$i < 1000} {incr i} {
                 $M set key-$i val-$i
-            } 
+            }
 
             $S replicaof $M_host $M_port
             wait_for_sync $S
 
             wait_for_gtid_sync $M $S
         }
-        
+
     }
 }

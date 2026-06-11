@@ -219,12 +219,12 @@ void gtidSeqGetStat(gtidSeq *seq, gtidSeqStat *stat);
 #define SKIPLIST_MAXLEVEL 16
 
 typedef struct skiplistNode {
-    long long score;                     
-    void *value;    
+    long long score;
+    void *value;
     struct skiplistNode *backward;
     struct {
-        struct skiplistNode *forward; 
-    } level[]; 
+        struct skiplistNode *forward;
+    } level[];
 } skiplistNode;
 
 typedef struct skipType {

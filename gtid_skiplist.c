@@ -1,6 +1,6 @@
 
 
-#define _DEFAULT_SOURCE  
+#define _DEFAULT_SOURCE
 #include <gtid.h>
 
 #include <stdlib.h>
@@ -58,15 +58,15 @@ int skiplistInsert(skiplist *sl, long long score,
     skiplistNode *x = sl->header;
 
     for (int i = sl->level - 1; i >= 0; i--) {
-        while (x->level[i].forward && x->level[i].forward->score < score) 
+        while (x->level[i].forward && x->level[i].forward->score < score)
             x = x->level[i].forward;
         if ( score_unique && x->level[i].forward && (x->level[i].forward->score == score)) {
             return 0;
-        }    
+        }
         update[i] = x;
     }
-    
-    
+
+
     int level = skiplistRandomLevel();
     if (level > sl->level) {
         for (int i = sl->level; i < level; i++)

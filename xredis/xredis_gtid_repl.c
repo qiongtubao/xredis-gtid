@@ -464,7 +464,7 @@ void masterAnaXsyncRequest(syncResult *result, syncRequest *request) {
                 psync_offset, server.repl_backlog_off,
                 server.repl_backlog_off+server.repl_backlog_histlen);
         goto end;
-    } 
+    }
     result->offset = psync_offset;
     locateServerReplMode(REPL_MODE_XSYNC,psync_offset,&slr);
 
@@ -638,7 +638,7 @@ void masterSetupPartialSynchronization(client *c, long long offset,
     c->replstate = SLAVE_STATE_ONLINE;
     c->repl_ack_time = server.unixtime;
     gtidClearReplStartCmdStreamOnAck(c);
-    
+
     listAddNodeTail(server.slaves,c);
 
     if (connWrite(c->conn,buf,buflen) != buflen) {
@@ -783,7 +783,7 @@ sds sendXsyncCommand(connection *conn) {
     sdsfree(gtid_slave_repr);
     sdsfree(gtid_lost_repr);
     return reply;
-} 
+}
 
 int ctrip_slaveTryPartialResynchronizationWrite(connection *conn) {
     int result = PSYNC_WAIT_REPLY;
@@ -1224,11 +1224,11 @@ void readBacklogIteratorInit(readBacklogIterator *it) {
 void readBacklogIteratorDeinit(readBacklogIterator *it) {
     gtidMockClientDeinit(&it->mock);
     it->mock.querybuf = NULL;
-    it->backlog = -1;  
+    it->backlog = -1;
 }
 
 void readBacklogIteratorSeekTo(readBacklogIterator *it, long long offset) {
-    serverAssert(offset >= 0);  
+    serverAssert(offset >= 0);
 
     if (it->backlog < 0) {
         it->backlog = offset;
@@ -1276,7 +1276,7 @@ ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
                               (unsigned long)it->mock.flags);
                     return -1;
                 }
-                break;  
+                break;
             }
             size_t consumed = buffered + total_read
                               - (sdslen(it->mock.querybuf) - it->mock.qb_pos);
@@ -1289,11 +1289,11 @@ ssize_t readBacklogIteratorParseNext(readBacklogIterator *it,
                                             &it->mock.querybuf,
                                             ONCE_READ_BUF_SIZE);
         if (nread <= 0) {
-            if (!any_read) return 0; 
+            if (!any_read) return 0;
             serverLog(LL_WARNING,
                       "[gaplog] gtidBacklogAppendToSds failed mid-cmd at offset %lld",
                       it->backlog);
-            
+
             return -1;
         }
         any_read = 1;
@@ -1402,7 +1402,7 @@ int parseGtidCommand(gtidGaplogKeysBuilder *builder, robj **argv, int argc) {
 
     getLongLongFromObject(argv[2], &dbid);
     gtidGaplogKeysBuilderAddFromCmd(builder, dbid, argv + 3, argc - 3);
-    return 0;  
+    return 0;
 }
 
 skipType gtid_skip_type = {
@@ -1503,10 +1503,10 @@ void saveGapLogFromGtidSet(gtidSet *mlost) {
                                        server.gtid_gap_log->size -
                                        server.gtid_xsync_max_gap);
                     }
-                    
+
                 }
                 gtidGaplogDeinitKeysBuilder(&builder);
-                
+
             }
             sdsfree(uuid);
         }
@@ -1650,7 +1650,7 @@ int ctrip_slaveTryPartialResynchronizationRead(connection *conn, sds reply) {
             serverLog(LL_NOTICE, "[xsync] gtid.set-slost(%s) = "
                     "gtid.set-continue(%s) - gtid.set-slave(%s)",
                     gtid_slost_repr,gtid_cont_repr,gtid_slave_repr);
-            
+
             if (server.gtid_gaplog_enabled) {
                 gtid_mlost = gtidSetDup(gtid_slave);
                 gtidSetDiff(gtid_mlost, gtid_cont);
@@ -2092,15 +2092,15 @@ int gtidTest(int argc, char **argv, int accurate) {
             gap_log->size++;
         }
 
-       
+
         sds uuid_key = sdsnew("uuid-test");
         dictAdd(gap_log->data, uuid_key, sl);
 
-        
+
         gtidGaplogDataIterator iter;
         gtidGaplogDataInitIterator(&iter, sl, 1);
 
-        
+
         gno_t gno = gtidGaplogDataGetGno(&iter);
         test_assert(gno == 1);
         gtidGaplogKeys *k1 = gtidGaplogDataNext(&iter);
@@ -2139,7 +2139,7 @@ int gtidTest(int argc, char **argv, int accurate) {
         test_assert(k_empty == NULL);
         gtidGaplogDeinitDataIterator(&iter);
 
-       
+
         gap_log->size = 0;
         dictEmpty(gap_log->data, NULL);
         listEmpty(gap_log->history);
@@ -2147,7 +2147,7 @@ int gtidTest(int argc, char **argv, int accurate) {
     }
 
     TEST("gtid - gapLog history iterator") {
-        
+
         gtidGaplog *gap_log = gtidGaplogNew();
 
         /* add uuid-1: [1-3, 10-12] */
@@ -2279,10 +2279,10 @@ int gtidTest(int argc, char **argv, int accurate) {
     }
 
     TEST("gtid - gapLog trim basic") {
-        
+
         gtidGaplog *gap_log = gtidGaplogNew();
 
-        
+
         skiplist *sl = skiplistCreate(&gtid_skip_type);
 
         /* add key  gno=2 */
@@ -2298,7 +2298,7 @@ int gtidTest(int argc, char **argv, int accurate) {
             gtidGaplogKeys *keys = gtidGaplogKeysBuild(&builder);
             gtidGaplogDeinitKeysBuilder(&builder);
 
-            skiplistInsert(sl, 2, keys, 1); 
+            skiplistInsert(sl, 2, keys, 1);
         }
         test_assert(sl->length == 1);
 
@@ -2312,8 +2312,8 @@ int gtidTest(int argc, char **argv, int accurate) {
 
         int trimmed = gtidGaplogTrim(gap_log, 1);
         test_assert(trimmed == 1);
-        test_assert(gap_log->size == 0); 
-        test_assert(listLength(gap_log->history) == 0); 
+        test_assert(gap_log->size == 0);
+        test_assert(listLength(gap_log->history) == 0);
 
         dictEmpty(gap_log->data, NULL);
         gtidGaplogRelease(gap_log);
@@ -2329,7 +2329,7 @@ int gtidTest(int argc, char **argv, int accurate) {
         test_assert(it.mock.qb_pos == 0);
 
         readBacklogIteratorDeinit(&it);
-        test_assert(it.backlog == -1);  
+        test_assert(it.backlog == -1);
         test_assert(it.mock.querybuf == NULL);
     }
 
@@ -2357,14 +2357,14 @@ int gtidTest(int argc, char **argv, int accurate) {
 
         readBacklogIteratorSeekTo(&it, 0);
         it.backlog = 1200;
-        it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 200);  
+        it.mock.querybuf = sdscatlen(it.mock.querybuf, "x", 200);
         it.mock.qb_pos = 0;
 
 
         readBacklogIteratorSeekTo(&it, 1050);
         test_assert(it.backlog == 1200);
-        test_assert(it.mock.qb_pos == 0);  
-        test_assert(sdslen(it.mock.querybuf) == 150);  
+        test_assert(it.mock.qb_pos == 0);
+        test_assert(sdslen(it.mock.querybuf) == 150);
 
         readBacklogIteratorDeinit(&it);
     }

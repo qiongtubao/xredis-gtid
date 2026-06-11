@@ -628,7 +628,7 @@ void gtidxCommand(client *c) {
             gtidGaplogDataInitIterator(&iter, sl, start_gno);
 
             long long count = 0;
-            void *arraylen = addReplyDeferredLen(c); 
+            void *arraylen = addReplyDeferredLen(c);
             gno_t gno;
             while ((gno = gtidGaplogDataGetGno(&iter)) != -1 && gno <= end_gno) {
                 gtidGaplogKeys *keys = gtidGaplogDataNext(&iter);

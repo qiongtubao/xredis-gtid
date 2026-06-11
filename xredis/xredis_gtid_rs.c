@@ -606,7 +606,7 @@ void serverReplStreamSwitch2Psync(const char *replid, long long reploff,
     clearMasterUuid();
     xsyncUuidInterestedInit();
 
-    
+
 }
 
 /* server repl stream could switch to xsync:
@@ -663,7 +663,7 @@ void serverReplStreamReset2Psync(const char *replid, long long reploff,
     clearMasterUuid();
     xsyncUuidInterestedInit();
     server.gtid_reploff_delta = 0;
-   
+
 }
 
 /* server repl stream could reset to xsync:
