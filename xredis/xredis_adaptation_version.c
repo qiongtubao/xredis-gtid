@@ -48,28 +48,31 @@ typedef struct {
 static void addKeyInfo(gtidGapLogKeysInfos *kis, int dbid, int type, sds key,
                        sds *subkeys, int subkeys_count)
 {
-    gtidGapLogKeyInfo *ki = createGtidGapLogKeyInfo(dbid, type, key, subkeys, subkeys_count);
-    kis->keys[kis->size++] = ki;
+    gtidGapLogKeysPrepareBuilder(builder, 1);
+    gtidGapLogKey *key_result = gtidGapLogKeyNew(dbid, type, key, subkeys, subkeys_count);
+    builder->keys_infos[builder->numkeys++] = key_result;
 }
 
 /* Gtid callback: sdsdup to create gtidGapLogKeyInfo in callback */
 static void gtidOnKey(void *ctx, int key_type, int key_arg_idx,
                       int subkeys_count, int subkeys_start,
-                      int subkeys_step, const int *subkey_arg_idxs)
+                      int subkeys_step, const int *subkey_arg_idxs,
+                      const cmdParseKeyExtra *extra)
 {
-    gtidOnKeyCtx *gctx = ctx;
-    sds key = sdsdup((sds)gctx->argv[key_arg_idx]->ptr);
+    UNUSED(extra);
+    UNUSED(argc);
+    gtidGapLogKeysBuilder *builder = ctx;
+    sds key = sdsdup((sds)argv[key_arg_idx]->ptr);
     sds *subkeys = subkeys_count > 0 ? zmalloc(sizeof(sds) * subkeys_count) : NULL;
     for (int i = 0; i < subkeys_count; i++) {
         int subkey_idx = subkey_arg_idxs ? subkey_arg_idxs[i] : (subkeys_start + i * subkeys_step);
-        subkeys[i] = sdsdup((sds)gctx->argv[subkey_idx]->ptr);
+        subkeys[i] = sdsdup((sds)argv[subkey_idx]->ptr);
     }
-    addKeyInfo(gctx->kis, gctx->dbid, key_type, key, subkeys, subkeys_count);
+    gtidGapLogKeysBuilderAdd(builder, dbid, cmdGetKeyType(cmd), key, subkeys, subkeys_count);
 }
 
-void addKeyInfoToKeysInfos(gtidGapLogKeysInfos *kis, int dbid, robj **args, int argc) {
-    if (argc < 2 || kis == NULL) return;
-
-    gtidOnKeyCtx ctx = { .dbid = dbid, .argv = args, .kis = kis };
-    cmdParseKeys(dbid, args, argc, &ctx, gtidOnKey);
+void gtidGapLogKeysBuilderAddFromCmd(gtidGapLogKeysBuilder *builder, int dbid, robj **args, int argc) {
+    if (argc < 2) return;
+    serverAssert( builder != NULL);
+    cmdParseKeys(dbid, NULL, args, argc, builder, gtidOnKey);
 }

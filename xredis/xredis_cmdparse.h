@@ -29,11 +29,14 @@ typedef void (*cmdParseOnKeyFn)(void *ctx, int key_type, int key_arg_idx,
                                 int subkeys_step, const int *subkey_arg_idxs);
 
 struct redisCommand;
+typedef void (*cmdParseOnKeyFn)(void *ctx, int dbid, struct redisCommand* cmd, robj** argv, int argc, int key_arg_idx,
+                                int subkeys_count, int subkeys_start,
+                                int subkeys_step, const int *subkey_arg_idxs,
+                                const cmdParseKeyExtra *extra);
 
 /* Command definition entry (for xredis_commands.def) */
 typedef struct cmdParseCommandDef {
     const char *name;
-    int (*count)(robj **argv, int argc);
     void (*parse)(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key);
 } cmdParseCommandDef;
 

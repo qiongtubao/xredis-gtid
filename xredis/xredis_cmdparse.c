@@ -61,26 +61,22 @@ static void cmdParseMset(int dbid, struct redisCommand *cmd, robj **argv, int ar
 
 /* --- hset / hmset: single key + subkeys (field), stride 2, starting at argv[2] --- */
 static void cmdParseHset(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
-    UNUSED(dbid);
     int subkeys_count = (argc - 2) / 2;
-    on_key(ctx, OBJ_HASH, 1, subkeys_count, 2, 2, NULL);
+    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, 2, 2, NULL, NULL);
 }
 
 /* --- hdel: single key + multiple subkeys, stride 1, starting at argv[2] --- */
 static void cmdParseHdel(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
     UNUSED(dbid);
     int subkeys_count = argc - 2;
-    on_key(ctx, OBJ_HASH, 1, subkeys_count, 2, 1, NULL);
+    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, 2, 1, NULL, NULL);
 }
 
 /* --- hsetnx / hincrby / hincrbyfloat: single key + 1 subkey --- */
 static void cmdParseHsetnx(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
     UNUSED(dbid);
-    if (argc >= 3) {
-        on_key(ctx, OBJ_HASH, 1, 1, 2, 1, NULL);
-    } else {
-        on_key(ctx, OBJ_HASH, 1, 0, 0, 0, NULL);
-    }
+    serverAssert(argc >= 3);
+    on_key(ctx, dbid, cmd, argv, argc, 1, 1, 2, 1, NULL, NULL);
 }
 
 /* --- sadd / srem / spop: single key + multiple subkeys, stride 1, starting at argv[2] --- */
@@ -123,7 +119,7 @@ static void cmdParseZadd(int dbid, struct redisCommand *cmd, robj **argv, int ar
         }
     }
     int subkeys_count = (argc - i) / 2;
-    on_key(ctx, OBJ_ZSET, 1, subkeys_count, i + 1, 2, NULL);
+    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, i + 1, 2, NULL, NULL);
 }
 
 /* --- zrem: single key + multiple subkeys, stride 1, starting at argv[2] --- */
@@ -136,11 +132,8 @@ static void cmdParseZrem(int dbid, struct redisCommand *cmd, robj **argv, int ar
 /* --- zincrby: single key + 1 subkey --- */
 static void cmdParseZincrby(int dbid, struct redisCommand *cmd, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
     UNUSED(dbid);
-    if (argc >= 4) {
-        on_key(ctx, OBJ_ZSET, 1, 1, 3, 1, NULL);
-    } else {
-        on_key(ctx, OBJ_ZSET, 1, 0, 0, 0, NULL);
-    }
+    serverAssert(argc >= 4);
+    on_key(ctx, dbid, cmd, argv, argc, 1, 1, 3, 1, NULL, NULL);
 }
 
 /* --- rename / renamenx: 2 keys --- */
@@ -152,6 +145,8 @@ static void cmdParseRename(int dbid, struct redisCommand *cmd, robj **argv, int 
     } else if (argc >= 2) {
         on_key(ctx, OBJ_UNKNOWN, 1, 0, 0, 0, NULL);
     }
+    int subkeys_count = (argc - i) / 3;  /* lon/lat/member  */
+    on_key(ctx, dbid, cmd, argv, argc, 1, subkeys_count, i + 2, 3, NULL, NULL); /* member 从 i+2 开始 */
 }
 
 /* ================================================================
@@ -179,17 +174,23 @@ int cmdParseCountKeys(robj **argv, int argc) {
 /* Parse command, notify each key position via callback (lookupCommand from server.commands) */
 void cmdParseKeys(int dbid, robj **argv, int argc, void *ctx, cmdParseOnKeyFn on_key) {
     if (argc < 1) return;
-    sds cmd_upper = sdsdupupper((sds)argv[0]->ptr);
-    struct redisCommand *cmd = lookupCommand(cmd_upper);
-    sdsfree(cmd_upper);
-    if (cmd != NULL && cmd->cmdparse_parse != NULL) {
-        cmd->cmdparse_parse(dbid, cmd, argv, argc, ctx, on_key);
-    } else if (argc >= 2) {
-        /* unknown command fallback */
-        serverLog(LL_WARNING, "Unknown command '%s' for key propagation", (sds)argv[0]->ptr);
-        // on_key(ctx, OBJ_UNKNOWN, 1, 0, 0, 0, NULL);
-        serverPanic("unknown command fallback");
+    if (cmd == NULL) {
+        cmd = lookupCommand(argv[0]->ptr);
     }
+    serverAssert(cmd != NULL);
+
+    if (cmd->cmdparse_parse != NULL) {
+        cmd->cmdparse_parse(dbid, cmd, argv, argc, ctx, on_key);
+        return;
+    }
+    
+    getKeysResult keys = GETKEYS_RESULT_INIT;
+    int numkeys = getKeysFromCommand(cmd, argv, argc, &keys);
+    for (int i = 0; i < numkeys; i++) {
+        on_key(ctx, dbid, cmd, argv, argc, keys.keys[i], 0, 0, 0, NULL, NULL);
+    }
+    getKeysFreeResult(&keys);
+    return;
 }
 
 /* Bind cmdparse functions to all commands in server.commands */
@@ -197,13 +198,9 @@ void cmdParseBindToCommands(void) {
     int i;
     for (i = 0; cmd_parse_commands[i].name != NULL; i++) {
         sds name = sdsnew(cmd_parse_commands[i].name);
-        for (size_t j = 0; j < sdslen(name); j++) {
-            name[j] = toupper((unsigned char)name[j]);
-        }
         struct redisCommand *cmd = lookupCommand(name);
         sdsfree(name);
         if (cmd != NULL) {
-            cmd->cmdparse_count = cmd_parse_commands[i].count;
             cmd->cmdparse_parse = cmd_parse_commands[i].parse;
         }
     }

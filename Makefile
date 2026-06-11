@@ -32,13 +32,13 @@ INSTALL=cp -rf
 	echo $(CTRIP_CC)
 	$(CTRIP_CC) $(DEBUG) -MMD -o $@ -c $<
 
-all: $(XREDIS_COMMANDS) $(GTID_LIB)
+all: $(GTID_LIB)
 
 $(XREDIS_COMMANDS):
 	python ./utils/generate_cmdparse_commands.py
 
 
-$(GTID_LIB): $(GTID_OBJ)
+$(GTID_LIB): $(GTID_OBJ) $(XREDIS_COMMANDS)
 	@mkdir -p lib
 	$(AR) $(ARFLAGS) $(GTID_LIB) $(GTID_OBJ)
 
