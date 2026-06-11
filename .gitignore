@@ -25,3 +25,4 @@ compile_commands.json
 gtid_test
 gtid_bench
 .cache/*
+xredis/xredis_commands.def

@@ -1342,17 +1342,15 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
         int inner_argc = inner_c.argc;
         robj *inner_argv3 = (inner_c.argc >= 4) ? inner_c.argv[3] : NULL;
 
+        /* Save argv pointer for key count calculation before move argv */
+        robj **saved_argv = inner_c.argv;
+        int saved_argc = inner_c.argc;
+
         /* move argv to cmdlist */
         gtidParsedCmdListAdd(&cmdlist, &inner_c);
 
         if (!strcasecmp(cmd0, "select")) {
-            
-        } else if (!strcasecmp(cmd0, "del") || !strcasecmp(cmd0, "unlink")) {
-            max_keys += inner_c.argc > 1 ? inner_c.argc - 1 : 1;
-        } else if (!strcasecmp(cmd0, "mset") || !strcasecmp(cmd0, "msetnx")) {
-            max_keys += inner_c.argc > 1 ? (inner_c.argc - 1) / 2 : 1;
-        } else if (!strcasecmp(cmd0, "smove") || !strcasecmp(cmd0, "rename") || !strcasecmp(cmd0, "renamenx")) {
-            max_keys += inner_c.argc >= 3 ? 2 : (inner_c.argc >= 2 ? 1 : 0);
+
         } else if (inner_argc >= 4 &&
             !strcasecmp(cmd0, "gtid") &&
             inner_argv3 != NULL &&
@@ -1360,7 +1358,7 @@ gtidGapLogKeysInfos * parseMultiCommand(long long multi_end_off, long long selec
             ) {
             break;
         } else {
-            max_keys++;
+            max_keys += cmdParseCountKeys(saved_argv, saved_argc);
         }
         
         next_off += inner_cmd_len;
@@ -1411,8 +1409,8 @@ gtidGapLogKeysInfos * parseGtidCommand(client *mock) {
     }
 
     getLongLongFromObject(mock->argv[2], &dbid);
-    /*key size max <=  command size - 4 ( gtid dbid uuid command)*/
-    gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(mock->argc - 4);
+    int key_count = cmdParseCountKeys(mock->argv + 3, mock->argc - 3);
+    gtidGapLogKeysInfos* kis = createGtidGapLogKeysInfos(key_count);
     addKeyInfoToKeysInfos(kis, dbid, mock->argv + 3, mock->argc - 3);
     return kis;
 }
